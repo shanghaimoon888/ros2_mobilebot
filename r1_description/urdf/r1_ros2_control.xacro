@@ -1,0 +1,66 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- 定义一个宏，方便传入参数 -->
+  <xacro:macro name="r1_ros2_control" params="name prefix">
+
+    <ros2_control name="${name}" type="system">
+      <hardware>
+        <!-- 你的硬件接口插件名 -->
+        <plugin>r1_hardware_interface/R1SystemHardware</plugin>
+
+        <!-- 硬件参数：根据你实际连接的 GPIO 引脚修改 -->
+		<param name="left_wheel_pwm_pin">16</param>
+		<param name="left_wheel_ain1_pin">20</param>
+		<param name="left_wheel_ain2_pin">21</param>
+		<param name="right_wheel_pwm_pin">13</param>
+		<param name="right_wheel_bin1_pin">19</param>
+		<param name="right_wheel_bin2_pin">26</param>
+
+        <param name="left_encoder_a_pin">17</param>
+        <param name="left_encoder_b_pin">27</param>
+        <param name="right_encoder_a_pin">22</param>
+        <param name="right_encoder_b_pin">23</param>
+
+        <!-- 编码器参数 -->
+        <param name="encoder_resolution">13</param>  <!-- 编码器线数 -->
+        <param name="gear_ratio">20</param>         <!-- 减速比 -->
+		<param name="wheel_radius">0.024</param>
+		
+		<!--<param name="max_velocity">1.0</param>
+		<param name="max_accel">3.0</param>		
+		<param name="velocity_filter_alpha">0.05</param>
+		<param name="pid_kp">0.5</param>
+		<param name="pid_ki">0.0</param>
+		<param name="pid_kd">0.0</param>-->
+		
+		<param name="max_velocity">3.0</param>
+		<param name="max_accel">1.5</param>
+		<param name="velocity_filter_alpha">0.05</param>
+		<param name="pid_kp">0.5</param>
+		<param name="pid_ki">0.0</param>
+		<param name="pid_kd">0.0</param>
+
+
+      </hardware>
+
+      <!-- 左轮关节接口 -->
+      <joint name="${prefix}left_wheel_joint">
+        <!-- 命令接口：接收 PID 控制器下发的目标速度 -->
+        <command_interface name="velocity"/>
+        <!-- 状态接口：PID 控制器读取的实际速度（来自编码器） -->
+        <state_interface name="velocity"/>
+        <!-- 状态接口：里程计计算需要的位置信息 -->
+        <state_interface name="position"/>
+      </joint>
+
+      <!-- 右轮关节接口 -->
+      <joint name="${prefix}right_wheel_joint">
+        <command_interface name="velocity"/>
+        <state_interface name="velocity"/>
+        <state_interface name="position"/>
+      </joint>
+    </ros2_control>
+  </xacro:macro>
+
+</robot>

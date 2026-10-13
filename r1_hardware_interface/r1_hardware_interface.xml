@@ -1,0 +1,10 @@
+<library path="r1_hardware_interface">
+  <class
+    name="r1_hardware_interface/R1SystemHardware"
+    type="r1_hardware_interface::R1SystemHardware"
+    base_class_type="hardware_interface::SystemInterface">
+    <description>
+      R1 三轮小车的 ros2_control 硬件接口，通过 TB6612 驱动电机并读取编码器反馈。
+    </description>
+  </class>
+</library>

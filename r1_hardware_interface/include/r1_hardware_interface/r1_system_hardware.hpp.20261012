@@ -1,0 +1,136 @@
+#ifndef R1_HARDWARE_INTERFACE__R1_SYSTEM_HARDWARE_HPP_
+#define R1_HARDWARE_INTERFACE__R1_SYSTEM_HARDWARE_HPP_
+
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "hardware_interface/handle.hpp"
+#include "hardware_interface/hardware_info.hpp"
+#include "hardware_interface/system_interface.hpp"
+#include "hardware_interface/types/hardware_interface_return_values.hpp"
+#include "rclcpp/macros.hpp"
+#include "rclcpp_lifecycle/state.hpp"
+
+// pigpio 头文件
+#include <pigpiod_if2.h>
+
+namespace r1_hardware_interface
+{
+
+class R1SystemHardware : public hardware_interface::SystemInterface
+{
+public:
+  RCLCPP_SHARED_PTR_DEFINITIONS(R1SystemHardware)
+
+  // ======================== 生命周期函数 ========================
+  hardware_interface::CallbackReturn on_init(
+    const hardware_interface::HardwareInfo & info) override;
+
+  hardware_interface::CallbackReturn on_configure(
+    const rclcpp_lifecycle::State & previous_state) override;
+
+  hardware_interface::CallbackReturn on_activate(
+    const rclcpp_lifecycle::State & previous_state) override;
+
+  hardware_interface::CallbackReturn on_deactivate(
+    const rclcpp_lifecycle::State & previous_state) override;
+
+  // ======================== 接口导出 ========================
+  std::vector<hardware_interface::StateInterface> export_state_interfaces() override;
+  std::vector<hardware_interface::CommandInterface> export_command_interfaces() override;
+
+  // ======================== 实时循环 ========================
+  hardware_interface::return_type read(
+    const rclcpp::Time & time, const rclcpp::Duration & period) override;
+
+  hardware_interface::return_type write(
+    const rclcpp::Time & time, const rclcpp::Duration & period) override;
+
+private:
+  // ======================== 编码器回调（静态，供 pigpio C 接口调用） ========================
+  static void left_encoder_callback(int pi, unsigned gpio, unsigned level, uint32_t tick);
+  static void right_encoder_callback(int pi, unsigned gpio, unsigned level, uint32_t tick);
+
+  // 静态实例指针：让静态回调函数能访问当前对象的成员变量
+  static R1SystemHardware * instance_;
+
+  // ======================== 硬件参数（从 URDF <param> 读取） ========================
+  // TB6612 控制引脚
+  int left_pwm_pin_ = -1;
+  int left_ain1_pin_ = -1;
+  int left_ain2_pin_ = -1;
+  int right_pwm_pin_ = -1;
+  int right_bin1_pin_ = -1;
+  int right_bin2_pin_ = -1;
+
+  // 编码器引脚
+  int left_encoder_a_pin_ = -1;
+  int left_encoder_b_pin_ = -1;
+  int right_encoder_a_pin_ = -1;
+  int right_encoder_b_pin_ = -1;
+
+  // 编码器/电机参数
+  double encoder_resolution_ = 11.0;   // 编码器线数（每转脉冲数）
+  double gear_ratio_ = 30.0;           // 减速比
+  double wheel_radius_ = 0.033;        // 轮半径（米）
+
+  // ======================== PID 参数 ========================
+  double kp_ = 1.0;
+  double ki_ = 0.0;
+  double kd_ = 0.0;
+  double integral_clamp_ = 10.0;        // 积分限幅，防止积分饱和
+  double max_velocity_ = 10.0;          // 速度限幅（rad/s），用于 PWM 映射
+  double velocity_filter_alpha_ = 0.3;  // 一阶低通滤波系数 (0~1)
+
+  // ======================== PID 内部状态 ========================
+  double left_integral_ = 0.0;
+  double right_integral_ = 0.0;
+  double left_prev_error_ = 0.0;
+  double right_prev_error_ = 0.0;
+
+  // 滤波后的速度（PID 的反馈输入）
+  double left_filtered_velocity_ = 0.0;
+  double right_filtered_velocity_ = 0.0;
+  
+  // --- 加速度限制 ---
+  double max_accel_ = 2.0;           // 最大加速度 rad/s²，从 URDF 读取
+  double left_prev_output_ = 0.0;    // 左轮上一周期的输出速度
+  double right_prev_output_ = 0.0;   // 右轮上一周期的输出速度
+
+  // ======================== pigpio 句柄与回调 ID ========================
+  int pi_handle_ = -1;
+  int left_encoder_cb_id_ = -1;
+  int right_encoder_cb_id_ = -1;
+  
+  // --- 目标方向变化检测 ---
+  double left_prev_target_ = 0.0;    // 左轮上一周期目标速度
+  double right_prev_target_ = 0.0;   // 右轮上一周期目标速度
+
+  // ======================== 关节状态与命令缓存 ========================
+  // 索引顺序与 URDF 中 <joint> 声明顺序一致：
+  //   [0] = left_wheel_joint
+  //   [1] = right_wheel_joint
+  std::vector<double> hw_commands_velocity_;  // 来自 diff_drive_controller 的目标速度 (rad/s)
+  std::vector<double> hw_states_velocity_;    // 反馈给控制器的实际速度 (rad/s)
+  std::vector<double> hw_states_position_;    // 反馈给控制器的位置 (rad)
+
+  // ======================== 编码器计数（原子类型，保证回调与 read 之间线程安全） ========================
+  std::atomic<int32_t> left_encoder_ticks_{0};
+  std::atomic<int32_t> right_encoder_ticks_{0};
+
+  // 上一次 read() 时的累计脉冲数（只在 read() 中访问，非原子即可）
+  int32_t prev_left_encoder_ticks_ = 0;
+  int32_t prev_right_encoder_ticks_ = 0;
+
+  // ======================== PID 辅助函数 ========================
+  double compute_pid(
+    double target, double actual, double dt,
+    double & integral, double & prev_error);
+};
+
+}  // namespace r1_hardware_interface
+
+#endif  // R1_HARDWARE_INTERFACE__R1_SYSTEM_HARDWARE_HPP_

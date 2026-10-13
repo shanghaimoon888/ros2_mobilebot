@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="r1_robot">
+
+  <!-- 1. 包含物理结构文件 -->
+  <xacro:include filename="$(find r1_description)/urdf/r1_core.xacro"/>
+
+  <!-- 2. 包含 ros2_control 控制接口文件 -->
+  <xacro:include filename="$(find r1_description)/urdf/r1_ros2_control.xacro"/>
+
+  <!-- 3. 调用 ros2_control 宏，生成控制标签 -->
+  <!-- 注意：这里的 joint 名需要和 r1_core.xacro 里定义的一致 -->
+  <xacro:r1_ros2_control name="R1System" prefix=""/>
+
+</robot>

@@ -1,0 +1,681 @@
+#include "r1_hardware_interface/r1_system_hardware.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "hardware_interface/types/hardware_interface_type_values.hpp"
+#include "pluginlib/class_list_macros.hpp"
+#include "rclcpp/rclcpp.hpp"
+
+namespace r1_hardware_interface
+{
+
+// ---------------------------------------------------------------------------
+// 静态实例指针：供 pigpio 的 C 回调函数访问当前对象
+// ---------------------------------------------------------------------------
+R1SystemHardware * R1SystemHardware::instance_ = nullptr;
+
+// ---------------------------------------------------------------------------
+// 编码器回调（A 相上升沿触发）
+// 通过读取 B 相电平判断旋转方向：
+//   B 相为低 → 正转，计数 +1
+//   B 相为高 → 反转，计数 -1
+// ---------------------------------------------------------------------------
+void R1SystemHardware::left_encoder_callback(
+  int pi, unsigned /*gpio*/, unsigned level, uint32_t /*tick*/)
+{
+  if (instance_ == nullptr || level != 1) {
+    return;
+  }
+  int b_level = gpio_read(pi, instance_->left_encoder_b_pin_);
+  if (b_level == 0) {
+    instance_->left_encoder_ticks_++;
+  } else {
+    instance_->left_encoder_ticks_--;
+  }
+}
+
+void R1SystemHardware::right_encoder_callback(
+  int pi, unsigned /*gpio*/, unsigned level, uint32_t /*tick*/)
+{
+  if (instance_ == nullptr || level != 1) {
+    return;
+  }
+  int b_level = gpio_read(pi, instance_->right_encoder_b_pin_);
+  if (b_level == 0) {
+    instance_->right_encoder_ticks_++;
+  } else {
+    instance_->right_encoder_ticks_--;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 辅助函数：安全地从 hardware_parameters 读取参数
+// ---------------------------------------------------------------------------
+static std::string get_required_param(
+  const hardware_interface::HardwareInfo & info, const std::string & key)
+{
+  auto it = info.hardware_parameters.find(key);
+  if (it == info.hardware_parameters.end()) {
+    throw std::runtime_error("Missing required hardware parameter: '" + key + "'");
+  }
+  return it->second;
+}
+
+static double get_optional_param(
+  const hardware_interface::HardwareInfo & info,
+  const std::string & key, double default_val)
+{
+  auto it = info.hardware_parameters.find(key);
+  return (it != info.hardware_parameters.end()) ? std::stod(it->second) : default_val;
+}
+
+// ---------------------------------------------------------------------------
+// 生命周期：on_init
+// ---------------------------------------------------------------------------
+hardware_interface::CallbackReturn R1SystemHardware::on_init(
+  const hardware_interface::HardwareInfo & info)
+{
+  if (hardware_interface::SystemInterface::on_init(info) !=
+      hardware_interface::CallbackReturn::SUCCESS)
+  {
+    return hardware_interface::CallbackReturn::ERROR;
+  }
+
+  try {
+    // --- TB6612 控制引脚 ---
+    left_pwm_pin_ = std::stoi(get_required_param(info, "left_wheel_pwm_pin"));
+    left_ain1_pin_ = std::stoi(get_required_param(info, "left_wheel_ain1_pin"));
+    left_ain2_pin_ = std::stoi(get_required_param(info, "left_wheel_ain2_pin"));
+    right_pwm_pin_ = std::stoi(get_required_param(info, "right_wheel_pwm_pin"));
+    right_bin1_pin_ = std::stoi(get_required_param(info, "right_wheel_bin1_pin"));
+    right_bin2_pin_ = std::stoi(get_required_param(info, "right_wheel_bin2_pin"));
+
+    // --- 编码器引脚 ---
+    left_encoder_a_pin_ = std::stoi(get_required_param(info, "left_encoder_a_pin"));
+    left_encoder_b_pin_ = std::stoi(get_required_param(info, "left_encoder_b_pin"));
+    right_encoder_a_pin_ = std::stoi(get_required_param(info, "right_encoder_a_pin"));
+    right_encoder_b_pin_ = std::stoi(get_required_param(info, "right_encoder_b_pin"));
+
+    // --- 编码器与电机参数 ---
+    encoder_resolution_ = std::stod(get_required_param(info, "encoder_resolution"));
+    gear_ratio_ = std::stod(get_required_param(info, "gear_ratio"));
+    wheel_radius_ = std::stod(get_required_param(info, "wheel_radius"));
+
+    // --- PID 参数（可选，有默认值） ---
+    kp_ = get_optional_param(info, "pid_kp", 1.0);
+    ki_ = get_optional_param(info, "pid_ki", 0.0);
+    kd_ = get_optional_param(info, "pid_kd", 0.0);
+    integral_clamp_ = get_optional_param(info, "pid_integral_clamp", 10.0);
+    max_velocity_ = get_optional_param(info, "max_velocity", 10.0);
+    velocity_filter_alpha_ = get_optional_param(info, "velocity_filter_alpha", 0.3);
+	
+	max_accel_ = get_optional_param(info, "max_accel", 2.0);
+	RCLCPP_INFO(
+		rclcpp::get_logger("R1SystemHardware"),
+		"max_accel = %.3f rad/s²", max_accel_);
+
+  } catch (const std::exception & e) {
+    RCLCPP_FATAL(
+      rclcpp::get_logger("R1SystemHardware"),
+      "Failed to read hardware parameters: %s", e.what());
+    return hardware_interface::CallbackReturn::ERROR;
+  }
+
+  // 初始化状态与命令缓存
+  const size_t n = info_.joints.size();
+  hw_commands_velocity_.assign(n, 0.0);
+  hw_states_velocity_.assign(n, 0.0);
+  hw_states_position_.assign(n, 0.0);
+
+  RCLCPP_INFO(
+    rclcpp::get_logger("R1SystemHardware"),
+    "Hardware initialized. PID: kp=%.3f ki=%.3f kd=%.3f clamp=%.3f max_vel=%.3f",
+    kp_, ki_, kd_, integral_clamp_, max_velocity_);
+
+  return hardware_interface::CallbackReturn::SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// 生命周期：on_configure
+// ---------------------------------------------------------------------------
+hardware_interface::CallbackReturn R1SystemHardware::on_configure(
+  const rclcpp_lifecycle::State & /*previous_state*/)
+{
+  // 连接 pigpio 守护进程
+  pi_handle_ = pigpio_start(nullptr, nullptr);
+  if (pi_handle_ < 0) {
+    RCLCPP_ERROR(
+      rclcpp::get_logger("R1SystemHardware"),
+      "Failed to connect to pigpio daemon! Make sure 'sudo pigpiod' is running.");
+    return hardware_interface::CallbackReturn::ERROR;
+  }
+
+  // TB6612 控制引脚设为输出
+  set_mode(pi_handle_, left_pwm_pin_, PI_OUTPUT);
+  set_mode(pi_handle_, left_ain1_pin_, PI_OUTPUT);
+  set_mode(pi_handle_, left_ain2_pin_, PI_OUTPUT);
+  set_mode(pi_handle_, right_pwm_pin_, PI_OUTPUT);
+  set_mode(pi_handle_, right_bin1_pin_, PI_OUTPUT);
+  set_mode(pi_handle_, right_bin2_pin_, PI_OUTPUT);
+
+  // 初始化时停止电机
+  set_PWM_dutycycle(pi_handle_, left_pwm_pin_, 0);
+  set_PWM_dutycycle(pi_handle_, right_pwm_pin_, 0);
+  gpio_write(pi_handle_, left_ain1_pin_, PI_LOW);
+  gpio_write(pi_handle_, left_ain2_pin_, PI_LOW);
+  gpio_write(pi_handle_, right_bin1_pin_, PI_LOW);
+  gpio_write(pi_handle_, right_bin2_pin_, PI_LOW);
+
+  // 编码器引脚设为输入
+  set_mode(pi_handle_, left_encoder_a_pin_, PI_INPUT);
+  set_mode(pi_handle_, left_encoder_b_pin_, PI_INPUT);
+  set_mode(pi_handle_, right_encoder_a_pin_, PI_INPUT);
+  set_mode(pi_handle_, right_encoder_b_pin_, PI_INPUT);
+
+  // 设置编码器 A 相上拉（避免悬空噪声）
+  set_pull_up_down(pi_handle_, left_encoder_a_pin_, PI_PUD_UP);
+  set_pull_up_down(pi_handle_, left_encoder_b_pin_, PI_PUD_UP);
+  set_pull_up_down(pi_handle_, right_encoder_a_pin_, PI_PUD_UP);
+  set_pull_up_down(pi_handle_, right_encoder_b_pin_, PI_PUD_UP);
+
+  // 设置 PWM 频率（TB6612 支持最高 100kHz，这里用 1kHz）
+  set_PWM_frequency(pi_handle_, left_pwm_pin_, 1000);
+  set_PWM_frequency(pi_handle_, right_pwm_pin_, 1000);
+
+  // 注册编码器回调（A 相上升沿）
+  instance_ = this;
+  left_encoder_cb_id_ = callback(
+    pi_handle_, left_encoder_a_pin_, RISING_EDGE, left_encoder_callback);
+  right_encoder_cb_id_ = callback(
+    pi_handle_, right_encoder_a_pin_, RISING_EDGE, right_encoder_callback);
+
+  if (left_encoder_cb_id_ < 0 || right_encoder_cb_id_ < 0) {
+    RCLCPP_ERROR(rclcpp::get_logger("R1SystemHardware"), "Failed to register encoder callbacks!");
+    return hardware_interface::CallbackReturn::ERROR;
+  }
+
+  RCLCPP_INFO(rclcpp::get_logger("R1SystemHardware"), "Hardware configured.");
+  return hardware_interface::CallbackReturn::SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// 生命周期：on_activate
+// ---------------------------------------------------------------------------
+hardware_interface::CallbackReturn R1SystemHardware::on_activate(
+  const rclcpp_lifecycle::State & /*previous_state*/)
+{
+  // 清零编码器计数、PID 状态
+  left_encoder_ticks_ = 0;
+  right_encoder_ticks_ = 0;
+  prev_left_encoder_ticks_ = 0;
+  prev_right_encoder_ticks_ = 0;
+
+  left_integral_ = 0.0;
+  right_integral_ = 0.0;
+  left_prev_error_ = 0.0;
+  right_prev_error_ = 0.0;
+
+  left_filtered_velocity_ = 0.0;
+  right_filtered_velocity_ = 0.0;
+
+  // 停止电机
+  set_PWM_dutycycle(pi_handle_, left_pwm_pin_, 0);
+  set_PWM_dutycycle(pi_handle_, right_pwm_pin_, 0);
+
+  RCLCPP_INFO(rclcpp::get_logger("R1SystemHardware"), "Hardware activated.");
+  return hardware_interface::CallbackReturn::SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// 生命周期：on_deactivate
+// ---------------------------------------------------------------------------
+hardware_interface::CallbackReturn R1SystemHardware::on_deactivate(
+  const rclcpp_lifecycle::State & /*previous_state*/)
+{
+  // 停用电机
+  if (pi_handle_ >= 0) {
+    set_PWM_dutycycle(pi_handle_, left_pwm_pin_, 0);
+    set_PWM_dutycycle(pi_handle_, right_pwm_pin_, 0);
+    gpio_write(pi_handle_, left_ain1_pin_, PI_LOW);
+    gpio_write(pi_handle_, left_ain2_pin_, PI_LOW);
+    gpio_write(pi_handle_, right_bin1_pin_, PI_LOW);
+    gpio_write(pi_handle_, right_bin2_pin_, PI_LOW);
+  }
+
+  RCLCPP_INFO(rclcpp::get_logger("R1SystemHardware"), "Hardware deactivated.");
+  return hardware_interface::CallbackReturn::SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// 导出状态接口
+// ---------------------------------------------------------------------------
+std::vector<hardware_interface::StateInterface>
+R1SystemHardware::export_state_interfaces()
+{
+  std::vector<hardware_interface::StateInterface> state_interfaces;
+  for (size_t i = 0; i < info_.joints.size(); ++i) {
+    state_interfaces.emplace_back(hardware_interface::StateInterface(
+      info_.joints[i].name, hardware_interface::HW_IF_VELOCITY, &hw_states_velocity_[i]));
+    state_interfaces.emplace_back(hardware_interface::StateInterface(
+      info_.joints[i].name, hardware_interface::HW_IF_POSITION, &hw_states_position_[i]));
+  }
+  return state_interfaces;
+}
+
+// ---------------------------------------------------------------------------
+// 导出命令接口
+// ---------------------------------------------------------------------------
+std::vector<hardware_interface::CommandInterface>
+R1SystemHardware::export_command_interfaces()
+{
+  std::vector<hardware_interface::CommandInterface> command_interfaces;
+  for (size_t i = 0; i < info_.joints.size(); ++i) {
+    command_interfaces.emplace_back(hardware_interface::CommandInterface(
+      info_.joints[i].name, hardware_interface::HW_IF_VELOCITY, &hw_commands_velocity_[i]));
+  }
+  return command_interfaces;
+}
+
+// ---------------------------------------------------------------------------
+// PID 计算辅助函数
+// ---------------------------------------------------------------------------
+double R1SystemHardware::compute_pid(
+  double target, double actual, double dt,
+  double & integral, double & prev_error)
+{
+  if (dt <= 0.0) {
+    return 0.0;
+  }
+
+  double error = target - actual;
+  integral += error * dt;
+
+  // 积分限幅，防止积分饱和
+  integral = std::max(-integral_clamp_, std::min(integral_clamp_, integral));
+
+  double derivative = (error - prev_error) / dt;
+  prev_error = error;
+
+  return kp_ * error + ki_ * integral + kd_ * derivative;
+}
+
+// ---------------------------------------------------------------------------
+// read()：从编码器读取脉冲，换算为轮速和位置
+// ---------------------------------------------------------------------------
+hardware_interface::return_type R1SystemHardware::read(
+  const rclcpp::Time & /*time*/, const rclcpp::Duration & period)
+{
+  double dt = period.seconds();
+  if (dt <= 0.0) {
+    return hardware_interface::return_type::OK;
+  }
+
+  // 读取当前编码器累计脉冲数（由回调维护）
+  int32_t left_ticks = left_encoder_ticks_.load();
+  int32_t right_ticks = right_encoder_ticks_.load();
+
+  int32_t left_delta = left_ticks - prev_left_encoder_ticks_;
+  int32_t right_delta = right_ticks - prev_right_encoder_ticks_;
+
+  prev_left_encoder_ticks_ = left_ticks;
+  prev_right_encoder_ticks_ = right_ticks;
+
+  // 脉冲 → 弧度：脉冲数 / (编码器线数 * 减速比) * 2π
+  const double ticks_per_rev = encoder_resolution_ * gear_ratio_;
+  const double rad_per_tick = (2.0 * M_PI) / ticks_per_rev;
+
+  double left_delta_rad = left_delta * rad_per_tick;
+  double right_delta_rad = right_delta * rad_per_tick;
+
+  // 原始速度 (rad/s)
+  double left_raw_vel = left_delta_rad / dt;
+  double right_raw_vel = right_delta_rad / dt;
+
+  // 一阶低通滤波，抑制编码器量化噪声
+  left_filtered_velocity_ =
+    velocity_filter_alpha_ * left_raw_vel +
+    (1.0 - velocity_filter_alpha_) * left_filtered_velocity_;
+  right_filtered_velocity_ =
+    velocity_filter_alpha_ * right_raw_vel +
+    (1.0 - velocity_filter_alpha_) * right_filtered_velocity_;
+
+  // 写入状态接口
+  hw_states_velocity_[0] = left_filtered_velocity_;
+  hw_states_velocity_[1] = right_filtered_velocity_;
+
+  // 位置累积 (rad)
+  hw_states_position_[0] += left_delta_rad;
+  hw_states_position_[1] += right_delta_rad;
+
+  return hardware_interface::return_type::OK;
+}
+
+// ---------------------------------------------------------------------------
+// write()：读取命令速度，结合编码器反馈做 PID，输出到 TB6612
+// ---------------------------------------------------------------------------
+#if 0
+hardware_interface::return_type R1SystemHardware::write(
+  const rclcpp::Time & /*time*/, const rclcpp::Duration & period)
+{
+  double dt = period.seconds();
+  if (dt <= 0.0) {
+    return hardware_interface::return_type::OK;
+  }
+
+  double left_target = hw_commands_velocity_[0];
+  double right_target = hw_commands_velocity_[1];
+
+  // 零目标阈值：小于 0.05 rad/s 视为停止
+  const double zero_threshold = 0.05;
+
+  // 辅助函数：设置一个电机的方向和 PWM
+  auto set_motor = [this](int pwm_pin, int in1_pin, int in2_pin, double velocity) {
+    double vel = std::max(-max_velocity_, std::min(max_velocity_, velocity));
+
+    if (vel > 0.0) {
+      gpio_write(pi_handle_, in1_pin, PI_HIGH);
+      gpio_write(pi_handle_, in2_pin, PI_LOW);
+    } else if (vel < 0.0) {
+      gpio_write(pi_handle_, in1_pin, PI_LOW);
+      gpio_write(pi_handle_, in2_pin, PI_HIGH);
+    } else {
+      gpio_write(pi_handle_, in1_pin, PI_LOW);
+      gpio_write(pi_handle_, in2_pin, PI_LOW);
+    }
+
+    int duty = static_cast<int>(std::fabs(vel) / max_velocity_ * 255.0);
+    duty = std::max(0, std::min(255, duty));
+    set_PWM_dutycycle(pi_handle_, pwm_pin, duty);
+  };
+
+  // 左轮：如果目标接近 0，直接停止，不走 PID
+  if (std::fabs(left_target) < zero_threshold) {
+    set_motor(left_pwm_pin_, left_ain1_pin_, left_ain2_pin_, 0.0);
+    left_integral_ = 0.0;      // 清零积分，防止下次启动时冲击
+    left_prev_error_ = 0.0;
+  } else {
+    double left_actual = hw_states_velocity_[0];
+    double left_correction = compute_pid(
+      left_target, left_actual, dt, left_integral_, left_prev_error_);
+    set_motor(left_pwm_pin_, left_ain1_pin_, left_ain2_pin_,
+              left_target + left_correction);
+  }
+
+  // 右轮同理
+  if (std::fabs(right_target) < zero_threshold) {
+    set_motor(right_pwm_pin_, right_bin1_pin_, right_bin2_pin_, 0.0);
+    right_integral_ = 0.0;
+    right_prev_error_ = 0.0;
+  } else {
+    double right_actual = hw_states_velocity_[1];
+    double right_correction = compute_pid(
+      right_target, right_actual, dt, right_integral_, right_prev_error_);
+    set_motor(right_pwm_pin_, right_bin1_pin_, right_bin2_pin_,
+              right_target + right_correction);
+  }
+
+  return hardware_interface::return_type::OK;
+}
+
+
+hardware_interface::return_type R1SystemHardware::write(
+  const rclcpp::Time & /*time*/, const rclcpp::Duration & period)
+{
+  double dt = period.seconds();
+  if (dt <= 0.0) {
+    return hardware_interface::return_type::OK;
+  }
+
+  double left_target = hw_commands_velocity_[0];
+  double right_target = hw_commands_velocity_[1];
+
+  // 零目标阈值：小于 0.05 rad/s 视为停止
+  const double zero_threshold = 0.05;
+
+  // 本周期允许的最大速度变化量（加速度限制）
+  // max_accel_ 单位：rad/s²，越小加速越平缓
+  const double max_delta = max_accel_ * dt;
+
+  // 辅助函数：设置一个电机的方向和 PWM
+  auto set_motor = [this](int pwm_pin, int in1_pin, int in2_pin, double velocity) {
+    double vel = std::max(-max_velocity_, std::min(max_velocity_, velocity));
+
+    if (vel > 0.0) {
+      gpio_write(pi_handle_, in1_pin, PI_HIGH);
+      gpio_write(pi_handle_, in2_pin, PI_LOW);
+    } else if (vel < 0.0) {
+      gpio_write(pi_handle_, in1_pin, PI_LOW);
+      gpio_write(pi_handle_, in2_pin, PI_HIGH);
+    } else {
+      gpio_write(pi_handle_, in1_pin, PI_LOW);
+      gpio_write(pi_handle_, in2_pin, PI_LOW);
+    }
+
+    int duty = static_cast<int>(std::fabs(vel) / max_velocity_ * 255.0);
+    duty = std::max(0, std::min(255, duty));
+    set_PWM_dutycycle(pi_handle_, pwm_pin, duty);
+  };
+
+  // ---------- 左轮 ----------
+  double left_final;
+  if (std::fabs(left_target) < zero_threshold) {
+    // 目标接近 0，直接停止
+    left_final = 0.0;
+    left_integral_ = 0.0;
+    left_prev_error_ = 0.0;
+    left_prev_output_ = 0.0;   // 重置斜率限制的历史值
+  } else {
+    // PID 计算
+    double left_actual = hw_states_velocity_[0];
+    double left_correction = compute_pid(
+      left_target, left_actual, dt, left_integral_, left_prev_error_);
+    left_final = left_target + left_correction;
+
+    // 加速度限制：限制本周期速度变化量
+    if (left_final > left_prev_output_ + max_delta) {
+      left_final = left_prev_output_ + max_delta;
+    } else if (left_final < left_prev_output_ - max_delta) {
+      left_final = left_prev_output_ - max_delta;
+    }
+    left_prev_output_ = left_final;
+  }
+  set_motor(left_pwm_pin_, left_ain1_pin_, left_ain2_pin_, left_final);
+
+  // ---------- 右轮 ----------
+  double right_final;
+  if (std::fabs(right_target) < zero_threshold) {
+    right_final = 0.0;
+    right_integral_ = 0.0;
+    right_prev_error_ = 0.0;
+    right_prev_output_ = 0.0;
+  } else {
+    double right_actual = hw_states_velocity_[1];
+    double right_correction = compute_pid(
+      right_target, right_actual, dt, right_integral_, right_prev_error_);
+    right_final = right_target + right_correction;
+
+    if (right_final > right_prev_output_ + max_delta) {
+      right_final = right_prev_output_ + max_delta;
+    } else if (right_final < right_prev_output_ - max_delta) {
+      right_final = right_prev_output_ - max_delta;
+    }
+    right_prev_output_ = right_final;
+  }
+  
+  // 左右轮速度耦合
+double avg = (left_final + right_final) / 2.0;
+const double coupling = 0.15;  // 0~1，越大越强制同步
+
+left_final  = left_final  * (1 - coupling) + avg * coupling;
+right_final = right_final * (1 - coupling) + avg * coupling;
+
+
+  set_motor(right_pwm_pin_, right_bin1_pin_, right_bin2_pin_, right_final);
+  
+  /*RCLCPP_INFO_THROTTLE(
+  rclcpp::get_logger("R1SystemHardware"),
+  *rclcpp::Clock::make_shared(), 500,
+  "L: tgt=%.3f act=%.3f out=%.3f | R: tgt=%.3f act=%.3f out=%.3f",
+  left_target, hw_states_velocity_[0], left_final,
+  right_target, hw_states_velocity_[1], right_final);*/
+
+  return hardware_interface::return_type::OK;
+}
+#endif
+
+hardware_interface::return_type R1SystemHardware::write(
+  const rclcpp::Time & /*time*/, const rclcpp::Duration & period)
+{
+  double dt = period.seconds();
+  if (dt <= 0.0) {
+    return hardware_interface::return_type::OK;
+  }
+
+  double left_target = hw_commands_velocity_[0];
+  double right_target = hw_commands_velocity_[1];
+
+  // 保存原始目标，用于日志对比
+  const double left_target_raw = left_target;
+  const double right_target_raw = right_target;
+
+  // 零目标阈值：小于 0.05 rad/s 视为停止
+  const double zero_threshold = 0.05;
+
+  // 后退速度缩放：后退时速度降为前进的 60%，提高稳定性
+  const double reverse_scale = 0.6;
+  if (left_target < -zero_threshold) {
+    left_target *= reverse_scale;
+  }
+  if (right_target < -zero_threshold) {
+    right_target *= reverse_scale;
+  }
+
+  // 本周期允许的最大速度变化量（加速度限制）
+  const double max_delta = max_accel_ * dt;
+
+  // 辅助函数：设置一个电机的方向和 PWM
+  auto set_motor = [this](int pwm_pin, int in1_pin, int in2_pin, double velocity) {
+    double vel = std::max(-max_velocity_, std::min(max_velocity_, velocity));
+
+    if (vel > 0.0) {
+      gpio_write(pi_handle_, in1_pin, PI_HIGH);
+      gpio_write(pi_handle_, in2_pin, PI_LOW);
+    } else if (vel < 0.0) {
+      gpio_write(pi_handle_, in1_pin, PI_LOW);
+      gpio_write(pi_handle_, in2_pin, PI_HIGH);
+    } else {
+      gpio_write(pi_handle_, in1_pin, PI_LOW);
+      gpio_write(pi_handle_, in2_pin, PI_LOW);
+    }
+
+    int duty = static_cast<int>(std::fabs(vel) / max_velocity_ * 255.0);
+    duty = std::max(0, std::min(255, duty));
+    set_PWM_dutycycle(pi_handle_, pwm_pin, duty);
+  };
+
+  // ---------- 左轮 ----------
+  double left_final;
+  double left_correction = 0.0;   // 用于日志
+  if (std::fabs(left_target) < zero_threshold) {
+    left_final = 0.0;
+    left_integral_ = 0.0;
+    left_prev_error_ = 0.0;
+    left_prev_output_ = 0.0;
+  } else {
+    // 目标方向变化时清零积分
+    if (left_target * left_prev_target_ < 0.0) {
+      left_integral_ = 0.0;
+      left_prev_error_ = 0.0;
+    }
+
+    double left_actual = hw_states_velocity_[0];
+    left_correction = compute_pid(
+      left_target, left_actual, dt, left_integral_, left_prev_error_);
+    left_final = left_target + left_correction;
+
+    // 加速度限制
+    if (left_final > left_prev_output_ + max_delta) {
+      left_final = left_prev_output_ + max_delta;
+    } else if (left_final < left_prev_output_ - max_delta) {
+      left_final = left_prev_output_ - max_delta;
+    }
+    left_prev_output_ = left_final;
+  }
+  left_prev_target_ = left_target;
+
+  // ---------- 右轮 ----------
+  double right_final;
+  double right_correction = 0.0;  // 用于日志
+  if (std::fabs(right_target) < zero_threshold) {
+    right_final = 0.0;
+    right_integral_ = 0.0;
+    right_prev_error_ = 0.0;
+    right_prev_output_ = 0.0;
+  } else {
+    if (right_target * right_prev_target_ < 0.0) {
+      right_integral_ = 0.0;
+      right_prev_error_ = 0.0;
+    }
+
+    double right_actual = hw_states_velocity_[1];
+    right_correction = compute_pid(
+      right_target, right_actual, dt, right_integral_, right_prev_error_);
+    right_final = right_target + right_correction;
+
+    if (right_final > right_prev_output_ + max_delta) {
+      right_final = right_prev_output_ + max_delta;
+    } else if (right_final < right_prev_output_ - max_delta) {
+      right_final = right_prev_output_ - max_delta;
+    }
+    right_prev_output_ = right_final;
+  }
+  right_prev_target_ = right_target;
+
+  // ---------- 左右轮速度耦合 ----------
+  double coupling = 0.1;
+  if (left_target < 0.0 || right_target < 0.0) {
+    coupling = 0.3;
+  }
+
+  double avg = (left_final + right_final) / 2.0;
+  double left_before_coupling = left_final;    // 用于日志
+  double right_before_coupling = right_final;  // 用于日志
+  left_final  = left_final  * (1.0 - coupling) + avg * coupling;
+  right_final = right_final * (1.0 - coupling) + avg * coupling;
+
+  // ---------- 输出到电机 ----------
+  set_motor(left_pwm_pin_, left_ain1_pin_, left_ain2_pin_, left_final);
+  set_motor(right_pwm_pin_, right_bin1_pin_, right_bin2_pin_, right_final);
+
+  // ============================================================
+  // 调试日志：每 500ms 打印一次，避免刷屏
+  // ============================================================
+  static rclcpp::Clock::SharedPtr log_clock = rclcpp::Clock::make_shared();
+
+  RCLCPP_INFO_THROTTLE(
+    rclcpp::get_logger("R1SystemHardware"),
+    *log_clock, 1000,
+    "tgt[%.3f,%.3f] raw[%.3f,%.3f] act[%.3f,%.3f] "
+    "pid[%.3f,%.3f] pre_couple[%.3f,%.3f] final[%.3f,%.3f] coup=%.2f",
+    left_target, right_target,
+    left_target_raw, right_target_raw,
+    hw_states_velocity_[0], hw_states_velocity_[1],
+    left_correction, right_correction,
+    left_before_coupling, right_before_coupling,
+    left_final, right_final,
+    coupling);
+
+  return hardware_interface::return_type::OK;
+}
+
+}  // namespace r1_hardware_interface
+
+// 导出插件
+PLUGINLIB_EXPORT_CLASS(
+  r1_hardware_interface::R1SystemHardware,
+  hardware_interface::SystemInterface)
