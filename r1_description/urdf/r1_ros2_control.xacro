@@ -35,9 +35,9 @@
 		<param name="pid_kd">0.0</param>-->
 		
 		<param name="max_velocity">3.0</param>
-		<param name="max_accel">1.5</param>
-		<param name="velocity_filter_alpha">0.05</param>
-		<param name="pid_kp">0.5</param>
+		<param name="max_accel">0.5</param>
+		<param name="velocity_filter_alpha">0.3</param>
+		<param name="pid_kp">0.0</param>
 		<param name="pid_ki">0.0</param>
 		<param name="pid_kd">0.0</param>
 

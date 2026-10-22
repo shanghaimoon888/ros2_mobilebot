@@ -49,7 +49,8 @@ class CameraPublisher(Node):
         # 初始化摄像头
         self.picam2 = Picamera2()
         config = self.picam2.create_preview_configuration(
-            main={"size": (640, 480), "format": "RGB888"}
+            #main={"size": (640, 480), "format": "RGB888"}
+            main={"size": (640, 480)}
         )
         self.picam2.configure(config)
         self.picam2.start()

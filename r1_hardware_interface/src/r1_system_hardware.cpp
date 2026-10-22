@@ -361,10 +361,13 @@ hardware_interface::return_type R1SystemHardware::read(
   return hardware_interface::return_type::OK;
 }
 
+
+#if 0
 // ==================== write ====================
 hardware_interface::return_type R1SystemHardware::write(
   const rclcpp::Time & /*time*/, const rclcpp::Duration & period)
 {
+   
   double dt = period.seconds();
   if (dt <= 0.0) return hardware_interface::return_type::OK;
 
@@ -395,13 +398,24 @@ hardware_interface::return_type R1SystemHardware::write(
     }
 
     int duty = static_cast<int>(std::fabs(vel) / max_velocity_ * 255.0);
+	
+	// ==================== 新增：死区补偿 ====================
+    // 实测电机在 PWM=10 时开始转动。为了防卡顿，只要指令不为0，最低给 12。
+    const int MIN_PWM = 12; 
+    if (duty > 0 && duty < MIN_PWM) {
+        duty = MIN_PWM;
+    }
+    // ========================================================
+	  
+	  
     duty = std::max(0, std::min(255, duty));
     set_PWM_dutycycle(pi_handle_, pwm_pin, duty);
   };
 
-  // ---------- 左轮 ----------
+// ---------- 左轮 ----------
   double left_final;
   double left_correction = 0.0;
+  
   if (std::fabs(left_target) < zero_threshold) {
     left_final = 0.0;
     left_integral_ = 0.0;
@@ -412,23 +426,38 @@ hardware_interface::return_type R1SystemHardware::write(
       left_integral_ = 0.0;
       left_prev_error_ = 0.0;
     }
+    
+    // 1. 计算平滑后的目标速度
+    double smoothed_left = left_target;
+    if (smoothed_left > left_prev_output_ + max_delta) {
+      smoothed_left = left_prev_output_ + max_delta;
+    } else if (smoothed_left < left_prev_output_ - max_delta) {
+      smoothed_left = left_prev_output_ - max_delta;
+    }
+    
+    // 2. 计算 PID 修正量
     double left_actual = hw_states_velocity_[0];
-    left_correction = compute_pid(
-      left_target, left_actual, dt, left_integral_, left_prev_error_);
-    left_final = left_target + left_correction;
+    left_correction = compute_pid(left_target, left_actual, dt, left_integral_, left_prev_error_);
+    
+    // 3. 叠加：平滑目标 + PID
+    left_final = smoothed_left + left_correction;
 
+    // 4. 【终极防线】：对最终输出再次进行加速度限制！
     if (left_final > left_prev_output_ + max_delta) {
       left_final = left_prev_output_ + max_delta;
     } else if (left_final < left_prev_output_ - max_delta) {
       left_final = left_prev_output_ - max_delta;
     }
-    left_prev_output_ = left_final;
+    
+    // 更新历史输出为最终输出
+    left_prev_output_ = left_final; 
   }
   left_prev_target_ = left_target;
 
   // ---------- 右轮 ----------
   double right_final;
   double right_correction = 0.0;
+  
   if (std::fabs(right_target) < zero_threshold) {
     right_final = 0.0;
     right_integral_ = 0.0;
@@ -439,16 +468,26 @@ hardware_interface::return_type R1SystemHardware::write(
       right_integral_ = 0.0;
       right_prev_error_ = 0.0;
     }
+    
+    double smoothed_right = right_target;
+    if (smoothed_right > right_prev_output_ + max_delta) {
+      smoothed_right = right_prev_output_ + max_delta;
+    } else if (smoothed_right < right_prev_output_ - max_delta) {
+      smoothed_right = right_prev_output_ - max_delta;
+    }
+    
     double right_actual = hw_states_velocity_[1];
-    right_correction = compute_pid(
-      right_target, right_actual, dt, right_integral_, right_prev_error_);
-    right_final = right_target + right_correction;
+    right_correction = compute_pid(right_target, right_actual, dt, right_integral_, right_prev_error_);
+    
+    right_final = smoothed_right + right_correction;
 
+    // 【终极防线】
     if (right_final > right_prev_output_ + max_delta) {
       right_final = right_prev_output_ + max_delta;
     } else if (right_final < right_prev_output_ - max_delta) {
       right_final = right_prev_output_ - max_delta;
     }
+    
     right_prev_output_ = right_final;
   }
   right_prev_target_ = right_target;
@@ -464,6 +503,7 @@ hardware_interface::return_type R1SystemHardware::write(
   double right_before_coupling = right_final;
   left_final  = left_final  * (1.0 - coupling) + avg * coupling;
   right_final = right_final * (1.0 - coupling) + avg * coupling;
+  
 
   // ---------- 输出到电机 ----------
   set_motor(left_pwm_pin_, left_ain1_pin_, left_ain2_pin_, left_final);
@@ -482,6 +522,54 @@ hardware_interface::return_type R1SystemHardware::write(
     left_before_coupling, right_before_coupling,
     left_final, right_final,
     coupling);
+
+  return hardware_interface::return_type::OK;
+
+}
+
+#endif
+
+hardware_interface::return_type R1SystemHardware::write(
+  const rclcpp::Time & /*time*/, const rclcpp::Duration & period)
+{
+  // 1. 直接读取控制器发来的目标轮速 (rad/s)
+  double left_target = hw_commands_velocity_[0];
+  double right_target = hw_commands_velocity_[1];
+
+  // 2. 简单的限幅（假设你的电机最高轮速是 5.0 rad/s）
+  const double max_limit = 5.0;
+  left_target = std::max(-max_limit, std::min(max_limit, left_target));
+  right_target = std::max(-max_limit, std::min(max_limit, right_target));
+
+  auto set_motor = [this](int pwm_pin, int in1_pin, int in2_pin, double velocity) {
+    // 方向控制
+    if (velocity > 0.0) {
+      gpio_write(pi_handle_, in1_pin, PI_HIGH);
+      gpio_write(pi_handle_, in2_pin, PI_LOW);
+    } else if (velocity < 0.0) {
+      gpio_write(pi_handle_, in1_pin, PI_LOW);
+      gpio_write(pi_handle_, in2_pin, PI_HIGH);
+    } else {
+      gpio_write(pi_handle_, in1_pin, PI_LOW);
+      gpio_write(pi_handle_, in2_pin, PI_LOW);
+    }
+
+    // 3. 速度直接映射为 PWM 占空比
+    // 假设 5.0 rad/s 对应 100% 占空比 (255)
+    int duty = static_cast<int>(std::fabs(velocity) / 5.0 * 255.0);
+    
+    // 4. 你的死区补偿
+    const int MIN_PWM = 12; 
+    if (duty > 0 && duty < MIN_PWM) {
+        duty = MIN_PWM;
+    }
+    duty = std::max(0, std::min(255, duty));
+    set_PWM_dutycycle(pi_handle_, pwm_pin, duty);
+  };
+
+  // 直接输出！
+  set_motor(left_pwm_pin_, left_ain1_pin_, left_ain2_pin_, left_target);
+  set_motor(right_pwm_pin_, right_bin1_pin_, right_bin2_pin_, right_target);
 
   return hardware_interface::return_type::OK;
 }

@@ -63,6 +63,16 @@ def generate_launch_description():
         ],
         output='screen'
     )
+    
+    # ============================================================
+    # 4. 新增：摄像头发布节点
+    # ============================================================
+    camera_node = Node(
+        package='camera_publisher',
+        executable='camera_publisher',
+        name='camera_publisher',
+        output='screen'
+    )
 
     diff_drive_spawner = Node(
         package='controller_manager',
@@ -88,6 +98,7 @@ def generate_launch_description():
     return LaunchDescription([
         robot_state_publisher_node,
         control_node,
+        camera_node,
         joint_state_broadcaster_spawner,
         delay_diff_drive,
     ])

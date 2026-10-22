@@ -75,7 +75,7 @@ private:
   // 编码器/电机参数
   double encoder_resolution_ = 11.0;
   double gear_ratio_ = 30.0;
-  double wheel_radius_ = 0.033;
+  double wheel_radius_ = 0.024;
 
   // ======================== PID 参数 ========================
   double kp_ = 1.0;

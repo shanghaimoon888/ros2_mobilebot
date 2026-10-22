@@ -5,7 +5,7 @@
   <xacro:property name="base_length" value="0.20"/>
   <xacro:property name="base_width" value="0.16"/>
   <xacro:property name="base_height" value="0.05"/>
-  <xacro:property name="wheel_radius" value="0.033"/>
+  <xacro:property name="wheel_radius" value="0.024"/>
   <xacro:property name="wheel_width" value="0.03"/>
   <xacro:property name="wheel_offset_x" value="0.0"/>
   <xacro:property name="wheel_offset_y" value="${base_width/2 + wheel_width/2}"/>
