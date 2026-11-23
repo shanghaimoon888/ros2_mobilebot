@@ -49,5 +49,10 @@ ros2_ws/src/
 ├── r1_description/          # 机器人 URDF 描述 (包含雷达与 IMU 的安装位置)
 ├── r1_hardware_interface/   # 硬件接口插件（C++串口桥接与ROS接口导出）
 ├── r1_bringup/              # 启动、控制器配置与 systemd 自启脚本
-├── voice_control/           # 语音控制节点（Vosk）
-└── ydlidar_ros2_driver/     # 雷达驱动 (Humble 分支)
+├── ydlidar_ros2_driver-humble/ # 激光雷达驱动 (Humble 分支)
+├── voice_control_node/      # 语音控制节点（Vosk 离线识别）
+├── camera_publisher_cpp/    # C++ CSI 摄像头图像发布节点
+├── pose_detector/           # 姿态检测节点
+├── color_follower/          # 颜色跟随节点
+├── color_tracker_test/      # 颜色追踪测试
+└── robot_dance/             # 机器人跳舞控制节点
