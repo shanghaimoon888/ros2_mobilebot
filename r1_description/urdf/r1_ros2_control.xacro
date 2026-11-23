@@ -40,7 +40,15 @@
 		<param name="pid_kp">0.0</param>
 		<param name="pid_ki">0.0</param>
 		<param name="pid_kd">0.0</param>
-
+		
+		
+		<!-- 串口参数 -->
+		<param name="serial_port">/dev/ttyAMA0</param>
+		<param name="baud_rate">9600</param>
+		  
+		<!-- 物理尺寸，必须和单片机里保持一致 -->
+		<param name="wheel_radius">0.024</param>
+		<param name="wheel_separation">0.16</param>
 
       </hardware>
 
@@ -60,6 +68,29 @@
         <state_interface name="velocity"/>
         <state_interface name="position"/>
       </joint>
+	  
+	  <!-- ======================== 新增：IMU 传感器 ======================== -->
+      <sensor name="imu_sensor">
+        <!-- 姿态 -->
+		<state_interface name="orientation.x"/>
+		<state_interface name="orientation.y"/>
+		<state_interface name="orientation.z"/>
+		<state_interface name="orientation.w"/>
+		<!-- 角速度 -->
+		<state_interface name="angular_velocity.x"/>
+		<state_interface name="angular_velocity.y"/>
+		<state_interface name="angular_velocity.z"/>
+		<!-- 线加速度 -->
+		<state_interface name="linear_acceleration.x"/>
+		<state_interface name="linear_acceleration.y"/>
+		<state_interface name="linear_acceleration.z"/>
+      </sensor>
+	  
+	  <!-- 测距传感器 -->
+	  <sensor name="range_sensor">
+		<state_interface name="range"/>
+	  </sensor>
+	  
     </ros2_control>
   </xacro:macro>
 

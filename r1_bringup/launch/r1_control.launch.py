@@ -84,6 +84,21 @@ def generate_launch_description():
         output='screen'
     )
 
+    imu_sensor_broadcaster_spawner = Node(
+        package='controller_manager',
+        executable='spawner',
+        arguments=['imu_sensor_broadcaster', '--controller-manager', '/controller_manager'],
+        output='screen'
+    )
+
+    # 确保在 joint_state_broadcaster 之后启动 IMU 广播
+    delay_imu = RegisterEventHandler(
+        event_handler=OnProcessExit(
+            target_action=joint_state_broadcaster_spawner,
+            on_exit=[imu_sensor_broadcaster_spawner],
+        )
+    )
+    
     # ============================================================
     # 4. 启动顺序控制
     #    等 joint_state_broadcaster 完成后，再启动 diff_drive_controller
@@ -98,7 +113,8 @@ def generate_launch_description():
     return LaunchDescription([
         robot_state_publisher_node,
         control_node,
-        camera_node,
+        #camera_node,
         joint_state_broadcaster_spawner,
+        delay_imu,
         delay_diff_drive,
     ])

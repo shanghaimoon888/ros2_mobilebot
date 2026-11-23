@@ -1,11 +1,10 @@
 #include "r1_hardware_interface/r1_system_hardware.hpp"
 
-#include <algorithm>
-#include <atomic>
 #include <cmath>
-#include <stdexcept>
-#include <string>
-#include <vector>
+#include <fcntl.h>
+#include <termios.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
 
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
 #include "pluginlib/class_list_macros.hpp"
@@ -14,111 +13,131 @@
 namespace r1_hardware_interface
 {
 
-// 静态实例指针
-R1SystemHardware * R1SystemHardware::instance_ = nullptr;
-
-// ==================== 方向查表（x4 正交解码） ====================
-static const int8_t QUAD_TABLE[16] = {
-     0, +1, -1,  0,
-    -1,  0,  0, +1,
-    +1,  0,  0, -1,
-     0, -1, +1,  0
-};
-
-// ==================== 编码器回调（查表法） ====================
-void R1SystemHardware::left_encoder_callback(
-  int pi, unsigned /*gpio*/, unsigned /*level*/, uint32_t /*tick*/)
-{
-  if (instance_ == nullptr) return;
-
-  int a = gpio_read(pi, instance_->left_encoder_a_pin_);
-  int b = gpio_read(pi, instance_->left_encoder_b_pin_);
-  int current = (a << 1) | b;
-  int index = (instance_->left_last_state_ << 2) | current;
-  instance_->left_last_state_ = current;
-
-  int8_t delta = QUAD_TABLE[index & 0x0F];
-  if (delta != 0) {
-    instance_->left_encoder_ticks_ += delta;
-  }
-}
-
-void R1SystemHardware::right_encoder_callback(
-  int pi, unsigned /*gpio*/, unsigned /*level*/, uint32_t /*tick*/)
-{
-  if (instance_ == nullptr) return;
-
-  int a = gpio_read(pi, instance_->right_encoder_a_pin_);
-  int b = gpio_read(pi, instance_->right_encoder_b_pin_);
-  int current = (a << 1) | b;
-  int index = (instance_->right_last_state_ << 2) | current;
-  instance_->right_last_state_ = current;
-
-  int8_t delta = QUAD_TABLE[index & 0x0F];
-  if (delta != 0) {
-    // 右轮镜像安装，方向已通过测试确认为 +=
-    instance_->right_encoder_ticks_ += delta;
-  }
-}
-
 // ==================== 参数读取辅助 ====================
-static std::string get_required_param(
-  const hardware_interface::HardwareInfo & info, const std::string & key)
+static std::string get_required_param(const hardware_interface::HardwareInfo & info, const std::string & key)
 {
   auto it = info.hardware_parameters.find(key);
-  if (it == info.hardware_parameters.end()) {
-    throw std::runtime_error("Missing required hardware parameter: '" + key + "'");
-  }
+  if (it == info.hardware_parameters.end()) throw std::runtime_error("Missing parameter: " + key);
   return it->second;
 }
 
-static double get_optional_param(
-  const hardware_interface::HardwareInfo & info,
-  const std::string & key, double default_val)
+static double get_optional_param(const hardware_interface::HardwareInfo & info, const std::string & key, double default_val)
 {
   auto it = info.hardware_parameters.find(key);
   return (it != info.hardware_parameters.end()) ? std::stod(it->second) : default_val;
 }
 
-// ==================== on_init ====================
-hardware_interface::CallbackReturn R1SystemHardware::on_init(
-  const hardware_interface::HardwareInfo & info)
+
+
+// ==================== 串口初始化辅助 ====================
+/*int setup_serial_port(const std::string& port, int baudrate) {
+    int fd = open(port.c_str(), O_RDWR | O_NOCTTY | O_NDELAY);
+    if (fd == -1) return -1;
+
+    struct termios options;
+    tcgetattr(fd, &options);
+    cfsetispeed(&options, baudrate);
+    cfsetospeed(&options, baudrate);
+    options.c_cflag |= (CLOCAL | CREAD);
+    options.c_cflag &= ~PARENB;
+    options.c_cflag &= ~CSTOPB;
+    options.c_cflag &= ~CSIZE;
+    options.c_cflag |= CS8;
+    options.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
+    options.c_iflag &= ~(IXON | IXOFF | IXANY);
+    options.c_oflag &= ~OPOST;
+    tcsetattr(fd, TCSANOW, &options);
+	tcflush(fd, TCIOFLUSH);
+    return fd;
+}*/
+/*int setup_serial_port(const std::string& port, int baudrate) {
+    int fd = open(port.c_str(), O_RDWR | O_NOCTTY | O_NDELAY);
+    if (fd == -1) return -1;
+
+    struct termios options;
+    tcgetattr(fd, &options);
+
+    // 1. 设置波特率
+    cfsetispeed(&options, baudrate);
+    cfsetospeed(&options, baudrate);
+
+    // 2. 原始模式（关键）
+    cfmakeraw(&options); 
+
+    // 3. 硬件控制流、软件控制流关闭
+    options.c_cflag |= (CLOCAL | CREAD);
+    options.c_cflag &= ~CRTSCTS;
+    options.c_iflag &= ~(IXON | IXOFF | IXANY);
+
+    // 4. 【核心修复】设置阻塞读取超时
+    // VMIN = 0, VTIME = 10 表示：如果没有数据，read 会阻塞等待最多 1 秒，期间一旦有数据就立刻返回
+    options.c_cc[VMIN] = 0;
+    options.c_cc[VTIME] = 10; 
+
+    tcsetattr(fd, TCSANOW, &options);
+    tcflush(fd, TCIOFLUSH);
+    return fd;
+}*/
+int setup_serial_port(const std::string& port, int baudrate) {
+    // 注意：不要用 O_NDELAY，改用 O_NONBLOCK
+    int fd = open(port.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (fd == -1) return -1;
+
+    struct termios options;
+    tcgetattr(fd, &options);
+
+    // 1. 强制转换为“原始模式”（等同于 pyserial 的默认行为）
+    cfmakeraw(&options);
+
+    // 2. 设置波特率
+    cfsetispeed(&options, baudrate);
+    cfsetospeed(&options, baudrate);
+
+    // 3. 关键：关闭硬件流控和软件流控！（你原来的代码漏了硬件流控）
+    options.c_cflag &= ~CRTSCTS;
+    options.c_iflag &= ~(IXON | IXOFF | IXANY);
+
+    // 4. 8N1，启用接收
+    options.c_cflag |= (CLOCAL | CREAD);
+    options.c_cflag &= ~PARENB;
+    options.c_cflag &= ~CSTOPB;
+    options.c_cflag &= ~CSIZE;
+    options.c_cflag |= CS8;
+
+    // 5. 非阻塞读取：只要有数据就立刻返回，没数据返回0
+    options.c_cc[VMIN] = 0;
+    options.c_cc[VTIME] = 0;
+
+    tcsetattr(fd, TCSANOW, &options);
+
+    // 清空所有历史脏数据
+    tcflush(fd, TCIOFLUSH); 
+
+    return fd;
+}
+
+uint8_t calc_checksum(uint8_t *data, uint8_t len) {
+    uint8_t sum = 0;
+    for (int i = 0; i < len; i++) sum += data[i];
+    return sum;
+}
+
+// ==================== 生命周期函数 ====================
+hardware_interface::CallbackReturn R1SystemHardware::on_init(const hardware_interface::HardwareInfo & info)
 {
-  if (hardware_interface::SystemInterface::on_init(info) !=
-      hardware_interface::CallbackReturn::SUCCESS)
-  {
+  if (hardware_interface::SystemInterface::on_init(info) != hardware_interface::CallbackReturn::SUCCESS)
     return hardware_interface::CallbackReturn::ERROR;
-  }
 
   try {
-    left_pwm_pin_ = std::stoi(get_required_param(info, "left_wheel_pwm_pin"));
-    left_ain1_pin_ = std::stoi(get_required_param(info, "left_wheel_ain1_pin"));
-    left_ain2_pin_ = std::stoi(get_required_param(info, "left_wheel_ain2_pin"));
-    right_pwm_pin_ = std::stoi(get_required_param(info, "right_wheel_pwm_pin"));
-    right_bin1_pin_ = std::stoi(get_required_param(info, "right_wheel_bin1_pin"));
-    right_bin2_pin_ = std::stoi(get_required_param(info, "right_wheel_bin2_pin"));
-
-    left_encoder_a_pin_ = std::stoi(get_required_param(info, "left_encoder_a_pin"));
-    left_encoder_b_pin_ = std::stoi(get_required_param(info, "left_encoder_b_pin"));
-    right_encoder_a_pin_ = std::stoi(get_required_param(info, "right_encoder_a_pin"));
-    right_encoder_b_pin_ = std::stoi(get_required_param(info, "right_encoder_b_pin"));
-
-    encoder_resolution_ = std::stod(get_required_param(info, "encoder_resolution"));
-    gear_ratio_ = std::stod(get_required_param(info, "gear_ratio"));
+    // 从 Xacro 的 <param> 中读取
+    serial_port_ = get_required_param(info, "serial_port");
+    baud_rate_ = std::stoi(get_required_param(info, "baud_rate"));
     wheel_radius_ = std::stod(get_required_param(info, "wheel_radius"));
-
-    kp_ = get_optional_param(info, "pid_kp", 1.0);
-    ki_ = get_optional_param(info, "pid_ki", 0.0);
-    kd_ = get_optional_param(info, "pid_kd", 0.0);
-    integral_clamp_ = get_optional_param(info, "pid_integral_clamp", 10.0);
-    max_velocity_ = get_optional_param(info, "max_velocity", 1.0);
-    velocity_filter_alpha_ = get_optional_param(info, "velocity_filter_alpha", 0.05);
-    max_accel_ = get_optional_param(info, "max_accel", 3.0);
-
+    
+    // 这里也可以从 param 读，如果你串口发的是线速度(m/s)，这里就用来转换
+    wheel_separation_ = get_optional_param(info, "wheel_separation", 0.16); 
   } catch (const std::exception & e) {
-    RCLCPP_FATAL(
-      rclcpp::get_logger("R1SystemHardware"),
-      "Failed to read hardware parameters: %s", e.what());
+    RCLCPP_FATAL(rclcpp::get_logger("R1SystemHardware"), "Param error: %s", e.what());
     return hardware_interface::CallbackReturn::ERROR;
   }
 
@@ -127,134 +146,54 @@ hardware_interface::CallbackReturn R1SystemHardware::on_init(
   hw_states_velocity_.assign(n, 0.0);
   hw_states_position_.assign(n, 0.0);
 
-  RCLCPP_INFO(
-    rclcpp::get_logger("R1SystemHardware"),
-    "Hardware initialized. PID: kp=%.3f ki=%.3f kd=%.3f max_vel=%.3f max_accel=%.3f filter=%.3f",
-    kp_, ki_, kd_, max_velocity_, max_accel_, velocity_filter_alpha_);
-
+  RCLCPP_INFO(rclcpp::get_logger("R1SystemHardware"), "Initialized. Serial: %s, Baud: %d", serial_port_.c_str(), baud_rate_);
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
-// ==================== on_configure ====================
-hardware_interface::CallbackReturn R1SystemHardware::on_configure(
-  const rclcpp_lifecycle::State & /*previous_state*/)
+hardware_interface::CallbackReturn R1SystemHardware::on_configure(const rclcpp_lifecycle::State &)
 {
-  pi_handle_ = pigpio_start(nullptr, nullptr);
-  if (pi_handle_ < 0) {
-    RCLCPP_ERROR(
-      rclcpp::get_logger("R1SystemHardware"),
-      "Failed to connect to pigpio daemon! Make sure 'sudo pigpiod' is running.");
+  serial_fd_ = setup_serial_port(serial_port_, baud_rate_);
+  if (serial_fd_ < 0) {
+    RCLCPP_ERROR(rclcpp::get_logger("R1SystemHardware"), "Failed to open serial port: %s", serial_port_.c_str());
     return hardware_interface::CallbackReturn::ERROR;
   }
-
-  // TB6612 控制引脚设为输出
-  set_mode(pi_handle_, left_pwm_pin_, PI_OUTPUT);
-  set_mode(pi_handle_, left_ain1_pin_, PI_OUTPUT);
-  set_mode(pi_handle_, left_ain2_pin_, PI_OUTPUT);
-  set_mode(pi_handle_, right_pwm_pin_, PI_OUTPUT);
-  set_mode(pi_handle_, right_bin1_pin_, PI_OUTPUT);
-  set_mode(pi_handle_, right_bin2_pin_, PI_OUTPUT);
-
-  // 初始停止
-  set_PWM_dutycycle(pi_handle_, left_pwm_pin_, 0);
-  set_PWM_dutycycle(pi_handle_, right_pwm_pin_, 0);
-  gpio_write(pi_handle_, left_ain1_pin_, PI_LOW);
-  gpio_write(pi_handle_, left_ain2_pin_, PI_LOW);
-  gpio_write(pi_handle_, right_bin1_pin_, PI_LOW);
-  gpio_write(pi_handle_, right_bin2_pin_, PI_LOW);
-
-  // 编码器引脚设为输入，启用上拉
-  set_mode(pi_handle_, left_encoder_a_pin_, PI_INPUT);
-  set_mode(pi_handle_, left_encoder_b_pin_, PI_INPUT);
-  set_mode(pi_handle_, right_encoder_a_pin_, PI_INPUT);
-  set_mode(pi_handle_, right_encoder_b_pin_, PI_INPUT);
-
-  set_pull_up_down(pi_handle_, left_encoder_a_pin_, PI_PUD_UP);
-  set_pull_up_down(pi_handle_, left_encoder_b_pin_, PI_PUD_UP);
-  set_pull_up_down(pi_handle_, right_encoder_a_pin_, PI_PUD_UP);
-  set_pull_up_down(pi_handle_, right_encoder_b_pin_, PI_PUD_UP);
-
-  // 设置 PWM 频率
-  set_PWM_frequency(pi_handle_, left_pwm_pin_, 1000);
-  set_PWM_frequency(pi_handle_, right_pwm_pin_, 1000);
-
-  // 初始化 last_state
-  left_last_state_  = (gpio_read(pi_handle_, left_encoder_a_pin_) << 1)
-                    | gpio_read(pi_handle_, left_encoder_b_pin_);
-  right_last_state_ = (gpio_read(pi_handle_, right_encoder_a_pin_) << 1)
-                    | gpio_read(pi_handle_, right_encoder_b_pin_);
-
-  // 注册 A/B 双回调，双边沿触发（x4 模式）
-  instance_ = this;
-  left_encoder_cb_a_ = callback(pi_handle_, left_encoder_a_pin_,  EITHER_EDGE, left_encoder_callback);
-  left_encoder_cb_b_ = callback(pi_handle_, left_encoder_b_pin_,  EITHER_EDGE, left_encoder_callback);
-  right_encoder_cb_a_ = callback(pi_handle_, right_encoder_a_pin_, EITHER_EDGE, right_encoder_callback);
-  right_encoder_cb_b_ = callback(pi_handle_, right_encoder_b_pin_, EITHER_EDGE, right_encoder_callback);
-
-  if (left_encoder_cb_a_ < 0 || left_encoder_cb_b_ < 0 ||
-      right_encoder_cb_a_ < 0 || right_encoder_cb_b_ < 0) {
-    RCLCPP_ERROR(rclcpp::get_logger("R1SystemHardware"), "Failed to register encoder callbacks!");
-    return hardware_interface::CallbackReturn::ERROR;
-  }
-
-  RCLCPP_INFO(rclcpp::get_logger("R1SystemHardware"), "Hardware configured (x4 encoder mode).");
+   
+  RCLCPP_INFO(rclcpp::get_logger("R1SystemHardware"), "Serial port configured.");
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
-// ==================== on_activate ====================
-hardware_interface::CallbackReturn R1SystemHardware::on_activate(
-  const rclcpp_lifecycle::State & /*previous_state*/)
+hardware_interface::CallbackReturn R1SystemHardware::on_activate(const rclcpp_lifecycle::State &)
 {
-  left_encoder_ticks_ = 0;
-  right_encoder_ticks_ = 0;
-  prev_left_encoder_ticks_ = 0;
-  prev_right_encoder_ticks_ = 0;
-
-  left_integral_ = 0.0;
-  right_integral_ = 0.0;
-  left_prev_error_ = 0.0;
-  right_prev_error_ = 0.0;
-
-  left_filtered_velocity_ = 0.0;
-  right_filtered_velocity_ = 0.0;
-
-  left_prev_output_ = 0.0;
-  right_prev_output_ = 0.0;
-  left_prev_target_ = 0.0;
-  right_prev_target_ = 0.0;
-
-  set_PWM_dutycycle(pi_handle_, left_pwm_pin_, 0);
-  set_PWM_dutycycle(pi_handle_, right_pwm_pin_, 0);
-
-  RCLCPP_INFO(rclcpp::get_logger("R1SystemHardware"), "Hardware activated.");
+  running_ = true;
+  serial_thread_ = std::thread(&R1SystemHardware::serial_receive_loop, this);
+  
+  for(int i=0; i<5; i++) {
+      send_speed_command(0, 0);
+      usleep(10000); // 间隔 10ms
+  }
+  
+  RCLCPP_INFO(rclcpp::get_logger("R1SystemHardware"), "Hardware activated. Serial thread started.");
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
-// ==================== on_deactivate ====================
-hardware_interface::CallbackReturn R1SystemHardware::on_deactivate(
-  const rclcpp_lifecycle::State & /*previous_state*/)
+hardware_interface::CallbackReturn R1SystemHardware::on_deactivate(const rclcpp_lifecycle::State &)
 {
-  if (pi_handle_ >= 0) {
-    set_PWM_dutycycle(pi_handle_, left_pwm_pin_, 0);
-    set_PWM_dutycycle(pi_handle_, right_pwm_pin_, 0);
-    gpio_write(pi_handle_, left_ain1_pin_, PI_LOW);
-    gpio_write(pi_handle_, left_ain2_pin_, PI_LOW);
-    gpio_write(pi_handle_, right_bin1_pin_, PI_LOW);
-    gpio_write(pi_handle_, right_bin2_pin_, PI_LOW);
+  running_ = false;
+  if (serial_thread_.joinable()) serial_thread_.join();
+  
+  if (serial_fd_ >= 0) {
+    // 发送 0 速度确保停车
+    send_speed_command(0, 0);
+    close(serial_fd_);
+    serial_fd_ = -1;
   }
-
-  if (left_encoder_cb_a_ >= 0) callback_cancel(left_encoder_cb_a_);
-  if (left_encoder_cb_b_ >= 0) callback_cancel(left_encoder_cb_b_);
-  if (right_encoder_cb_a_ >= 0) callback_cancel(right_encoder_cb_a_);
-  if (right_encoder_cb_b_ >= 0) callback_cancel(right_encoder_cb_b_);
-
+  
   RCLCPP_INFO(rclcpp::get_logger("R1SystemHardware"), "Hardware deactivated.");
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
-// ==================== 导出状态接口 ====================
-std::vector<hardware_interface::StateInterface>
-R1SystemHardware::export_state_interfaces()
+// ==================== 接口导出 ====================
+std::vector<hardware_interface::StateInterface> R1SystemHardware::export_state_interfaces()
 {
   std::vector<hardware_interface::StateInterface> state_interfaces;
   for (size_t i = 0; i < info_.joints.size(); ++i) {
@@ -263,12 +202,32 @@ R1SystemHardware::export_state_interfaces()
     state_interfaces.emplace_back(hardware_interface::StateInterface(
       info_.joints[i].name, hardware_interface::HW_IF_POSITION, &hw_states_position_[i]));
   }
+  
+// ======================== 导出 IMU 接口 ========================
+  // 姿态
+  state_interfaces.emplace_back(hardware_interface::StateInterface("imu_sensor", "orientation.x", &hw_states_imu_q_x_));
+  state_interfaces.emplace_back(hardware_interface::StateInterface("imu_sensor", "orientation.y", &hw_states_imu_q_y_));
+  state_interfaces.emplace_back(hardware_interface::StateInterface("imu_sensor", "orientation.z", &hw_states_imu_q_z_));
+  state_interfaces.emplace_back(hardware_interface::StateInterface("imu_sensor", "orientation.w", &hw_states_imu_q_w_));
+  
+  // 角速度
+  state_interfaces.emplace_back(hardware_interface::StateInterface("imu_sensor", "angular_velocity.x", &hw_states_imu_angular_x_));
+  state_interfaces.emplace_back(hardware_interface::StateInterface("imu_sensor", "angular_velocity.y", &hw_states_imu_angular_y_));
+  state_interfaces.emplace_back(hardware_interface::StateInterface("imu_sensor", "angular_velocity.z", &hw_states_imu_angular_z_));
+  
+  // 线加速度
+  state_interfaces.emplace_back(hardware_interface::StateInterface("imu_sensor", "linear_acceleration.x", &hw_states_imu_linear_x_));
+  state_interfaces.emplace_back(hardware_interface::StateInterface("imu_sensor", "linear_acceleration.y", &hw_states_imu_linear_y_));
+  state_interfaces.emplace_back(hardware_interface::StateInterface("imu_sensor", "linear_acceleration.z", &hw_states_imu_linear_z_)); 
+  
+  // 距离
+  state_interfaces.emplace_back(hardware_interface::StateInterface("range_sensor", "range", &hw_states_range_));
+	
+	
   return state_interfaces;
 }
 
-// ==================== 导出命令接口 ====================
-std::vector<hardware_interface::CommandInterface>
-R1SystemHardware::export_command_interfaces()
+std::vector<hardware_interface::CommandInterface> R1SystemHardware::export_command_interfaces()
 {
   std::vector<hardware_interface::CommandInterface> command_interfaces;
   for (size_t i = 0; i < info_.joints.size(); ++i) {
@@ -278,305 +237,365 @@ R1SystemHardware::export_command_interfaces()
   return command_interfaces;
 }
 
-// ==================== PID 计算 ====================
-double R1SystemHardware::compute_pid(
-  double target, double actual, double dt,
-  double & integral, double & prev_error)
+// ==================== 核心：read 与 write ====================
+hardware_interface::return_type R1SystemHardware::read(const rclcpp::Time &, const rclcpp::Duration & period)
 {
-  if (dt <= 0.0) return 0.0;
-
-  double error = target - actual;
-
-  // 积分分离：误差大时不计积分
-  const double integral_separation_threshold = 0.5;
-  if (std::fabs(error) < integral_separation_threshold) {
-    integral += error * dt;
-    integral = std::max(-integral_clamp_, std::min(integral_clamp_, integral));
+  // 直接在 read() 里死等串口是大忌！所以真实速度更新全在后台线程里完成。
+  // read() 只需要极速把最新的数据从缓存里交出去。
+  
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  
+  // 位置积分 (使用后台线程更新的速度)
+  if (period.seconds() > 0) {
+    hw_states_position_[0] += hw_states_velocity_[0] * period.seconds();
+    hw_states_position_[1] += hw_states_velocity_[1] * period.seconds();
   }
+  
+   // 2. 欧拉角转四元数
+  double roll_rad = hw_states_imu_roll_ * M_PI / 180.0;
+  double pitch_rad = hw_states_imu_pitch_ * M_PI / 180.0;
+  double yaw_rad = hw_states_imu_yaw_ * M_PI / 180.0;
 
-  double derivative = (error - prev_error) / dt;
-  prev_error = error;
+  double cy = cos(yaw_rad * 0.5);
+  double sy = sin(yaw_rad * 0.5);
+  double cp = cos(pitch_rad * 0.5);
+  double sp = sin(pitch_rad * 0.5);
+  double cr = cos(roll_rad * 0.5);
+  double sr = sin(roll_rad * 0.5);
 
-  return kp_ * error + ki_ * integral + kd_ * derivative;
+  hw_states_imu_q_w_ = cr * cp * cy + sr * sp * sy;
+  hw_states_imu_q_x_ = sr * cp * cy - cr * sp * sy;
+  hw_states_imu_q_y_ = cr * sp * cy + sr * cp * sy;
+  hw_states_imu_q_z_ = cr * cp * sy - sr * sp * cy;
+  
+  return hardware_interface::return_type::OK;
 }
 
-// ==================== read ====================
-hardware_interface::return_type R1SystemHardware::read(
-  const rclcpp::Time & /*time*/, const rclcpp::Duration & period)
+hardware_interface::return_type R1SystemHardware::write(const rclcpp::Time &, const rclcpp::Duration &)
 {
-  double dt = period.seconds();
-  if (dt <= 0.0) return hardware_interface::return_type::OK;
+  // 1. 读取控制器发来的目标轮速 (rad/s)
+  double left_target_rad = hw_commands_velocity_[0];
+  double right_target_rad = hw_commands_velocity_[1];
 
-  int32_t left_ticks = left_encoder_ticks_.load();
-  int32_t right_ticks = right_encoder_ticks_.load();
+  // 2. 将 rad/s 转换为线速度 mm/s，发给 STM32
+  // v = omega * r
+  int16_t left_mm_s = static_cast<int16_t>(left_target_rad * wheel_radius_ * 1000.0);
+  int16_t right_mm_s = static_cast<int16_t>(right_target_rad * wheel_radius_ * 1000.0);
 
-  int32_t left_delta = left_ticks - prev_left_encoder_ticks_;
-  int32_t right_delta = right_ticks - prev_right_encoder_ticks_;
-
-  prev_left_encoder_ticks_ = left_ticks;
-  prev_right_encoder_ticks_ = right_ticks;
-
-  // 脉冲合理性检查：丢弃异常大的增量
-  const int32_t max_plausible_delta = 300;  // x4 模式下 100Hz 周期的合理上限
-  if (std::abs(left_delta) > max_plausible_delta) left_delta = 0;
-  if (std::abs(right_delta) > max_plausible_delta) right_delta = 0;
-
-  // x4 模式：每圈计数 = encoder_resolution × gear_ratio × 4
-  const double ticks_per_rev = encoder_resolution_ * gear_ratio_ * 4.0;
-  const double rad_per_tick = (2.0 * M_PI) / ticks_per_rev;
-
-  double left_delta_rad = left_delta * rad_per_tick;
-  double right_delta_rad = right_delta * rad_per_tick;
-
-  double left_raw_vel = left_delta_rad / dt;
-  double right_raw_vel = right_delta_rad / dt;
-
-  // 一阶低通滤波
-  left_filtered_velocity_ =
-    velocity_filter_alpha_ * left_raw_vel +
-    (1.0 - velocity_filter_alpha_) * left_filtered_velocity_;
-  right_filtered_velocity_ =
-    velocity_filter_alpha_ * right_raw_vel +
-    (1.0 - velocity_filter_alpha_) * right_filtered_velocity_;
-
-  // 零目标时冻结编码器读数，避免停止时的噪声
-  const double zero_threshold = 0.05;
-  if (std::fabs(hw_commands_velocity_[0]) < zero_threshold) {
-    hw_states_velocity_[0] = 0.0;
-    left_filtered_velocity_ = 0.0;
-  } else {
-    hw_states_velocity_[0] = left_filtered_velocity_;
-  }
-
-  if (std::fabs(hw_commands_velocity_[1]) < zero_threshold) {
-    hw_states_velocity_[1] = 0.0;
-    right_filtered_velocity_ = 0.0;
-  } else {
-    hw_states_velocity_[1] = right_filtered_velocity_;
-  }
-
-  hw_states_position_[0] += left_delta_rad;
-  hw_states_position_[1] += right_delta_rad;
+  // 3. 发送给 STM32
+  send_speed_command(left_mm_s, right_mm_s);
 
   return hardware_interface::return_type::OK;
 }
 
+// ==================== 串口发送与接收线程 ====================
+void R1SystemHardware::send_speed_command(int16_t left_mm_s, int16_t right_mm_s)
+{
+  if (serial_fd_ < 0) return;
+
+  uint8_t buffer[9];
+  buffer[0] = 0xAA;
+  buffer[1] = 0x55;
+  buffer[2] = 5;    // 长度 (Cmd + 数据 4字节)
+  buffer[3] = 0x01; // 功能码：设置速度
+  buffer[4] = left_mm_s & 0xFF;
+  buffer[5] = (left_mm_s >> 8) & 0xFF;
+  buffer[6] = right_mm_s & 0xFF;
+  buffer[7] = (right_mm_s >> 8) & 0xFF;
+  buffer[8] = calc_checksum(&buffer[2], 6);
+
+  ::write(serial_fd_, buffer, 9);
+}
 
 #if 0
-// ==================== write ====================
-hardware_interface::return_type R1SystemHardware::write(
-  const rclcpp::Time & /*time*/, const rclcpp::Duration & period)
+void R1SystemHardware::serial_receive_loop()
 {
-   
-  double dt = period.seconds();
-  if (dt <= 0.0) return hardware_interface::return_type::OK;
-
-  double left_target = hw_commands_velocity_[0];
-  double right_target = hw_commands_velocity_[1];
-
-  const double zero_threshold = 0.05;
-
-  // 后退速度缩放
-  const double reverse_scale = 0.6;
-  if (left_target < -zero_threshold) left_target *= reverse_scale;
-  if (right_target < -zero_threshold) right_target *= reverse_scale;
-
-  const double max_delta = max_accel_ * dt;
-
-  auto set_motor = [this](int pwm_pin, int in1_pin, int in2_pin, double velocity) {
-    double vel = std::max(-max_velocity_, std::min(max_velocity_, velocity));
-
-    if (vel > 0.0) {
-      gpio_write(pi_handle_, in1_pin, PI_HIGH);
-      gpio_write(pi_handle_, in2_pin, PI_LOW);
-    } else if (vel < 0.0) {
-      gpio_write(pi_handle_, in1_pin, PI_LOW);
-      gpio_write(pi_handle_, in2_pin, PI_HIGH);
-    } else {
-      gpio_write(pi_handle_, in1_pin, PI_LOW);
-      gpio_write(pi_handle_, in2_pin, PI_LOW);
-    }
-
-    int duty = static_cast<int>(std::fabs(vel) / max_velocity_ * 255.0);
-	
-	// ==================== 新增：死区补偿 ====================
-    // 实测电机在 PWM=10 时开始转动。为了防卡顿，只要指令不为0，最低给 12。
-    const int MIN_PWM = 12; 
-    if (duty > 0 && duty < MIN_PWM) {
-        duty = MIN_PWM;
-    }
-    // ========================================================
-	  
-	  
-    duty = std::max(0, std::min(255, duty));
-    set_PWM_dutycycle(pi_handle_, pwm_pin, duty);
-  };
-
-// ---------- 左轮 ----------
-  double left_final;
-  double left_correction = 0.0;
+  uint8_t rx_buffer[128];
+  int state = 0; 
+  int rx_index = 0;
   
-  if (std::fabs(left_target) < zero_threshold) {
-    left_final = 0.0;
-    left_integral_ = 0.0;
-    left_prev_error_ = 0.0;
-    left_prev_output_ = 0.0;
-  } else {
-    if (left_target * left_prev_target_ < 0.0) {
-      left_integral_ = 0.0;
-      left_prev_error_ = 0.0;
-    }
-    
-    // 1. 计算平滑后的目标速度
-    double smoothed_left = left_target;
-    if (smoothed_left > left_prev_output_ + max_delta) {
-      smoothed_left = left_prev_output_ + max_delta;
-    } else if (smoothed_left < left_prev_output_ - max_delta) {
-      smoothed_left = left_prev_output_ - max_delta;
-    }
-    
-    // 2. 计算 PID 修正量
-    double left_actual = hw_states_velocity_[0];
-    left_correction = compute_pid(left_target, left_actual, dt, left_integral_, left_prev_error_);
-    
-    // 3. 叠加：平滑目标 + PID
-    left_final = smoothed_left + left_correction;
-
-    // 4. 【终极防线】：对最终输出再次进行加速度限制！
-    if (left_final > left_prev_output_ + max_delta) {
-      left_final = left_prev_output_ + max_delta;
-    } else if (left_final < left_prev_output_ - max_delta) {
-      left_final = left_prev_output_ - max_delta;
-    }
-    
-    // 更新历史输出为最终输出
-    left_prev_output_ = left_final; 
-  }
-  left_prev_target_ = left_target;
-
-  // ---------- 右轮 ----------
-  double right_final;
-  double right_correction = 0.0;
+  // 用于一次性读取的临时缓冲
+  uint8_t read_buf[32]; 
   
-  if (std::fabs(right_target) < zero_threshold) {
-    right_final = 0.0;
-    right_integral_ = 0.0;
-    right_prev_error_ = 0.0;
-    right_prev_output_ = 0.0;
-  } else {
-    if (right_target * right_prev_target_ < 0.0) {
-      right_integral_ = 0.0;
-      right_prev_error_ = 0.0;
-    }
-    
-    double smoothed_right = right_target;
-    if (smoothed_right > right_prev_output_ + max_delta) {
-      smoothed_right = right_prev_output_ + max_delta;
-    } else if (smoothed_right < right_prev_output_ - max_delta) {
-      smoothed_right = right_prev_output_ - max_delta;
-    }
-    
-    double right_actual = hw_states_velocity_[1];
-    right_correction = compute_pid(right_target, right_actual, dt, right_integral_, right_prev_error_);
-    
-    right_final = smoothed_right + right_correction;
-
-    // 【终极防线】
-    if (right_final > right_prev_output_ + max_delta) {
-      right_final = right_prev_output_ + max_delta;
-    } else if (right_final < right_prev_output_ - max_delta) {
-      right_final = right_prev_output_ - max_delta;
-    }
-    
-    right_prev_output_ = right_final;
-  }
-  right_prev_target_ = right_target;
-
-  // ---------- 左右轮速度耦合 ----------
-  double coupling = 0.1;
-  if (left_target < 0.0 || right_target < 0.0) {
-    coupling = 0.3;
-  }
-
-  double avg = (left_final + right_final) / 2.0;
-  double left_before_coupling = left_final;
-  double right_before_coupling = right_final;
-  left_final  = left_final  * (1.0 - coupling) + avg * coupling;
-  right_final = right_final * (1.0 - coupling) + avg * coupling;
+  RCLCPP_INFO(rclcpp::get_logger("R1SystemHardware"), "Serial receive thread started.");
   
+  while (running_ && rclcpp::ok()) {
+    // 【核心修复】：一次最多读 32 个字节，而不是每次只读 1 个字节
+    int n = ::read(serial_fd_, read_buf, sizeof(read_buf));
+    
+    if (n <= 0) {
+        continue; // 因为设了 VTIME，如果没数据会自动阻塞，不需要 usleep
+    }
 
-  // ---------- 输出到电机 ----------
-  set_motor(left_pwm_pin_, left_ain1_pin_, left_ain2_pin_, left_final);
-  set_motor(right_pwm_pin_, right_bin1_pin_, right_bin2_pin_, right_final);
+    // 把读到的数据逐个字节丢进状态机
+    for (int i = 0; i < n; i++) {
+        uint8_t byte = read_buf[i];
 
-  // ---------- 调试日志 ----------
-  static rclcpp::Clock::SharedPtr log_clock = rclcpp::Clock::make_shared();
-  RCLCPP_INFO_THROTTLE(
-    rclcpp::get_logger("R1SystemHardware"),
-    *log_clock, 500,
-    "tgt[%.3f,%.3f] act[%.3f,%.3f] pid[%.3f,%.3f] "
-    "pre_couple[%.3f,%.3f] final[%.3f,%.3f] coup=%.2f",
-    left_target, right_target,
-    hw_states_velocity_[0], hw_states_velocity_[1],
-    left_correction, right_correction,
-    left_before_coupling, right_before_coupling,
-    left_final, right_final,
-    coupling);
+        switch (state) {
+          case 0:
+            if (byte == 0xAA) state = 1;
+            break;
+          case 1:
+            if (byte == 0x55) state = 2;
+            else state = 0;
+            break;
+          case 2:
+            rx_buffer[2] = byte;
+            rx_index = 0;
+            state = 3;
+            break;
+          case 3:
+            rx_buffer[3 + rx_index] = byte;
+            rx_index++;
+            if (rx_index >= rx_buffer[2]) state = 4;
+            break;
+          case 4:
+            {
+              // 校验（+1 是把功能码算上）
+              uint8_t calc = calc_checksum(&rx_buffer[2], rx_buffer[2] + 1);
+              if (calc == byte) {
+                // 校验通过！
+                if (rx_buffer[3] == 0x83) { 
+                  uint16_t left_raw = (static_cast<uint16_t>(rx_buffer[5]) << 8) | static_cast<uint16_t>(rx_buffer[4]);
+                  int16_t left_mm_s = static_cast<int16_t>(left_raw);
+                  uint16_t right_raw = (static_cast<uint16_t>(rx_buffer[7]) << 8) | static_cast<uint16_t>(rx_buffer[6]);
+                  int16_t right_mm_s = static_cast<int16_t>(right_raw);
+                  
+                  uint16_t yaw_raw = (static_cast<uint16_t>(rx_buffer[9]) << 8) | static_cast<uint16_t>(rx_buffer[8]);
+                  int16_t yaw_100 = static_cast<int16_t>(yaw_raw);
+                  uint16_t pitch_raw = (static_cast<uint16_t>(rx_buffer[11]) << 8) | static_cast<uint16_t>(rx_buffer[10]);
+                  int16_t pitch_100 = static_cast<int16_t>(pitch_raw);
+                  uint16_t roll_raw = (static_cast<uint16_t>(rx_buffer[13]) << 8) | static_cast<uint16_t>(rx_buffer[12]);
+                  int16_t roll_100 = static_cast<int16_t>(roll_raw);
 
-  return hardware_interface::return_type::OK;
+                  uint16_t gz_raw = (static_cast<uint16_t>(rx_buffer[15]) << 8) | static_cast<uint16_t>(rx_buffer[14]);
+                  int16_t gz = static_cast<int16_t>(gz_raw);
 
+                  uint16_t ax_raw = (static_cast<uint16_t>(rx_buffer[17]) << 8) | static_cast<uint16_t>(rx_buffer[16]);
+                  int16_t ax = static_cast<int16_t>(ax_raw);
+                  uint16_t ay_raw = (static_cast<uint16_t>(rx_buffer[19]) << 8) | static_cast<uint16_t>(rx_buffer[18]);
+                  int16_t ay = static_cast<int16_t>(ay_raw);
+
+                  std::lock_guard<std::mutex> lock(data_mutex_);
+                  hw_states_velocity_[0] = (left_mm_s / 1000.0) / wheel_radius_;
+                  hw_states_velocity_[1] = (right_mm_s / 1000.0) / wheel_radius_;
+                  
+                  hw_states_imu_yaw_ = yaw_100 / 100.0;
+                  hw_states_imu_pitch_ = pitch_100 / 100.0;
+                  hw_states_imu_roll_ = roll_100 / 100.0;
+
+                  hw_states_imu_angular_z_ = (gz / 16.4) * M_PI / 180.0; 
+                  
+                  hw_states_imu_linear_x_ = (ax / 16384.0) * 9.81;
+                  hw_states_imu_linear_y_ = (ay / 16384.0) * 9.81;
+                  hw_states_imu_linear_z_ = 9.81;
+				  
+				  static rclcpp::Clock::SharedPtr log_clock = rclcpp::Clock::make_shared();
+				  // 【日志5】：解析成功的数值
+                  RCLCPP_INFO_THROTTLE(
+                    rclcpp::get_logger("R1Serial"), *log_clock, 500,
+                    "解析成功！Yaw: %.2f, Pitch: %.2f | 速度 L: %d, R: %d", 
+                    hw_states_imu_yaw_, hw_states_imu_pitch_, left_mm_s, right_mm_s);
+                }
+              }
+              state = 0; // 恢复等待帧头
+            }
+            break;
+        }
+    }
+  }
 }
-
 #endif
 
-hardware_interface::return_type R1SystemHardware::write(
-  const rclcpp::Time & /*time*/, const rclcpp::Duration & period)
+void R1SystemHardware::serial_receive_loop()
 {
-  // 1. 直接读取控制器发来的目标轮速 (rad/s)
-  double left_target = hw_commands_velocity_[0];
-  double right_target = hw_commands_velocity_[1];
-
-  // 2. 简单的限幅（假设你的电机最高轮速是 5.0 rad/s）
-  const double max_limit = 5.0;
-  left_target = std::max(-max_limit, std::min(max_limit, left_target));
-  right_target = std::max(-max_limit, std::min(max_limit, right_target));
-
-  auto set_motor = [this](int pwm_pin, int in1_pin, int in2_pin, double velocity) {
-    // 方向控制
-    if (velocity > 0.0) {
-      gpio_write(pi_handle_, in1_pin, PI_HIGH);
-      gpio_write(pi_handle_, in2_pin, PI_LOW);
-    } else if (velocity < 0.0) {
-      gpio_write(pi_handle_, in1_pin, PI_LOW);
-      gpio_write(pi_handle_, in2_pin, PI_HIGH);
-    } else {
-      gpio_write(pi_handle_, in1_pin, PI_LOW);
-      gpio_write(pi_handle_, in2_pin, PI_LOW);
-    }
-
-    // 3. 速度直接映射为 PWM 占空比
-    // 假设 5.0 rad/s 对应 100% 占空比 (255)
-    int duty = static_cast<int>(std::fabs(velocity) / 5.0 * 255.0);
+  uint8_t rx_buffer[128];
+  int rx_index = 0;
+  int state = 0; // 0:找0xAA, 1:找0x55, 2:接收长度, 3:接收数据, 4:接收校验和
+  
+  RCLCPP_INFO(rclcpp::get_logger("R1SystemHardware"), "Serial receive thread started.");
+  
+  while (running_ && rclcpp::ok()) {
+    uint8_t byte;
+    int n = ::read(serial_fd_, &byte, 1);
     
-    // 4. 你的死区补偿
-    const int MIN_PWM = 12; 
-    if (duty > 0 && duty < MIN_PWM) {
-        duty = MIN_PWM;
+    if (n <= 0) {
+      usleep(1000); // 没有数据，休眠 1ms 防止 CPU 100%
+      continue;
     }
-    duty = std::max(0, std::min(255, duty));
-    set_PWM_dutycycle(pi_handle_, pwm_pin, duty);
-  };
+	
+	//RCLCPP_INFO(rclcpp::get_logger("SerialRaw"), "收到字节: 0x%02X", byte);
 
-  // 直接输出！
-  set_motor(left_pwm_pin_, left_ain1_pin_, left_ain2_pin_, left_target);
-  set_motor(right_pwm_pin_, right_bin1_pin_, right_bin2_pin_, right_target);
+    switch (state) {
+      case 0:
+        if (byte == 0xAA) state = 1;
+        break;
+      case 1:
+        if (byte == 0x55) state = 2;
+        else state = 0;
+        break;
+      case 2:
+        rx_buffer[2] = byte;
+        rx_index = 0;
+        state = 3;
+        break;
+      case 3:
+        rx_buffer[3 + rx_index] = byte;
+        rx_index++;
+        if (rx_index >= rx_buffer[2]) state = 4;
+        break;
+      case 4:
+        {
+          // 【修复1】：长度要 +1，把功能码和4个数据字节都算进去（共6字节）
+          uint8_t calc = calc_checksum(&rx_buffer[2], rx_buffer[2] + 1);
+          
+          if (calc == byte) {
+#if 0			  
+			  // 校验通过！判断功能码
+            if (rx_buffer[3] == 0x83) { // 超级反馈帧
+              
+              // 1. 提取速度
+              uint16_t left_raw = (static_cast<uint16_t>(rx_buffer[5]) << 8) | static_cast<uint16_t>(rx_buffer[4]);
+              int16_t left_mm_s = static_cast<int16_t>(left_raw);
+              uint16_t right_raw = (static_cast<uint16_t>(rx_buffer[7]) << 8) | static_cast<uint16_t>(rx_buffer[6]);
+              int16_t right_mm_s = static_cast<int16_t>(right_raw);
+              
+              // 2. 提取姿态
+              uint16_t yaw_raw = (static_cast<uint16_t>(rx_buffer[9]) << 8) | static_cast<uint16_t>(rx_buffer[8]);
+              int16_t yaw_100 = static_cast<int16_t>(yaw_raw);
+              uint16_t pitch_raw = (static_cast<uint16_t>(rx_buffer[11]) << 8) | static_cast<uint16_t>(rx_buffer[10]);
+              int16_t pitch_100 = static_cast<int16_t>(pitch_raw);
+              uint16_t roll_raw = (static_cast<uint16_t>(rx_buffer[13]) << 8) | static_cast<uint16_t>(rx_buffer[12]);
+              int16_t roll_100 = static_cast<int16_t>(roll_raw);
 
-  return hardware_interface::return_type::OK;
+              // 3. 提取角速度
+              uint16_t gz_raw = (static_cast<uint16_t>(rx_buffer[15]) << 8) | static_cast<uint16_t>(rx_buffer[14]);
+              int16_t gz = static_cast<int16_t>(gz_raw);
+
+              // 4. 提取加速度
+              uint16_t ax_raw = (static_cast<uint16_t>(rx_buffer[17]) << 8) | static_cast<uint16_t>(rx_buffer[16]);
+              int16_t ax = static_cast<int16_t>(ax_raw);
+              uint16_t ay_raw = (static_cast<uint16_t>(rx_buffer[19]) << 8) | static_cast<uint16_t>(rx_buffer[18]);
+              int16_t ay = static_cast<int16_t>(ay_raw);
+
+              std::lock_guard<std::mutex> lock(data_mutex_);
+              // 存速度
+              hw_states_velocity_[0] = (left_mm_s / 1000.0) / wheel_radius_;
+              hw_states_velocity_[1] = (right_mm_s / 1000.0) / wheel_radius_;
+              
+              // 存姿态
+              hw_states_imu_yaw_ = yaw_100 / 100.0;
+              hw_states_imu_pitch_ = pitch_100 / 100.0;
+              hw_states_imu_roll_ = roll_100 / 100.0;
+
+              // 存角速度 (弧度/秒)
+              hw_states_imu_angular_z_ = (gz / 16.4) * M_PI / 180.0; 
+              
+              // 存加速度 (米/秒^2)
+              hw_states_imu_linear_x_ = (ax / 16384.0) * 9.81;
+              hw_states_imu_linear_y_ = (ay / 16384.0) * 9.81;
+              hw_states_imu_linear_z_ = 9.81;
+            }
+			
+#endif			
+			
+			  
+#if 1
+            // 校验通过！解析数据
+            if (rx_buffer[3] == 0x81) { // 底盘状态反馈
+              
+              // 【修复2】：先转成无符号的 uint16_t，再强转成有符号的 int16_t
+              uint16_t left_raw = (static_cast<uint16_t>(rx_buffer[5]) << 8) | static_cast<uint16_t>(rx_buffer[4]);
+              int16_t left_mm_s = static_cast<int16_t>(left_raw);
+              
+              uint16_t right_raw = (static_cast<uint16_t>(rx_buffer[7]) << 8) | static_cast<uint16_t>(rx_buffer[6]);
+              int16_t right_mm_s = static_cast<int16_t>(right_raw);
+              
+              // 将 mm/s 转换回 rad/s，存给状态接口
+              std::lock_guard<std::mutex> lock(data_mutex_);
+              hw_states_velocity_[0] = (left_mm_s / 1000.0) / wheel_radius_;
+              hw_states_velocity_[1] = (right_mm_s / 1000.0) / wheel_radius_;
+			  
+			  static rclcpp::Clock::SharedPtr log_clock = rclcpp::Clock::make_shared();
+              RCLCPP_INFO_THROTTLE(
+                rclcpp::get_logger("R1SystemHardware"),
+                *log_clock, 500,
+                "【RX from STM32】 L: %d mm/s, R: %d mm/s  -->  ROS L: %.2f rad/s, R: %.2f rad/s",
+                left_mm_s, right_mm_s, 
+                hw_states_velocity_[0], hw_states_velocity_[1]);
+            }
+			// ================= 2. 解析 IMU 姿态反馈 0x82 =================
+            else if (rx_buffer[3] == 0x82) {
+             // 提取 Yaw
+              uint16_t yaw_raw = (static_cast<uint16_t>(rx_buffer[5]) << 8) | static_cast<uint16_t>(rx_buffer[4]);
+              int16_t yaw_100 = static_cast<int16_t>(yaw_raw);
+
+              // 提取 Pitch
+              uint16_t pitch_raw = (static_cast<uint16_t>(rx_buffer[7]) << 8) | static_cast<uint16_t>(rx_buffer[6]);
+              int16_t pitch_100 = static_cast<int16_t>(pitch_raw);
+
+              // 提取 Roll (新增)
+              uint16_t roll_raw = (static_cast<uint16_t>(rx_buffer[9]) << 8) | static_cast<uint16_t>(rx_buffer[8]);
+              int16_t roll_100 = static_cast<int16_t>(roll_raw);
+
+			  // 2. 提取角速度 Z (原始 LSB)
+              uint16_t gz_raw = (static_cast<uint16_t>(rx_buffer[11]) << 8) | static_cast<uint16_t>(rx_buffer[10]);
+              int16_t gz = static_cast<int16_t>(gz_raw);
+
+              // 3. 提取加速度 X / Y (原始 LSB)
+              uint16_t ax_raw = (static_cast<uint16_t>(rx_buffer[13]) << 8) | static_cast<uint16_t>(rx_buffer[12]);
+              int16_t ax = static_cast<int16_t>(ax_raw);
+              
+              uint16_t ay_raw = (static_cast<uint16_t>(rx_buffer[15]) << 8) | static_cast<uint16_t>(rx_buffer[14]);
+              int16_t ay = static_cast<int16_t>(ay_raw);
+
+              // 4. 存入变量并转换单位
+              std::lock_guard<std::mutex> lock(data_mutex_);
+              hw_states_imu_yaw_ = yaw_100 / 100.0;
+              hw_states_imu_pitch_ = pitch_100 / 100.0;
+              hw_states_imu_roll_ = roll_100 / 100.0;
+
+              // 角速度：+2000dps 量程下，16.4 LSB = 1度/秒。
+              // 转成弧度/秒：(gz / 16.4) * (PI / 180)
+              hw_states_imu_angular_z_ = (gz / 16.4) * M_PI / 180.0; 
+              hw_states_imu_angular_x_ = 0.0; 
+              hw_states_imu_angular_y_ = 0.0; 
+
+              // 线加速度：+2g 量程下，16384 LSB = 1g。
+              // 转成 m/s^2：(ax / 16384.0) * 9.81
+              hw_states_imu_linear_x_ = (ax / 16384.0) * 9.81;
+              hw_states_imu_linear_y_ = (ay / 16384.0) * 9.81;
+              hw_states_imu_linear_z_ = 9.81; // 默认平放，Z 轴就是重力
+            }
+			else if(rx_buffer[3] == 0x84)
+			{
+			  // 假设: 0x84帧，4号字节低字节，5号高字节，单位 cm
+			  uint16_t dist_cm_raw = (static_cast<uint16_t>(rx_buffer[5]) << 8) | static_cast<uint16_t>(rx_buffer[4]);
+			  double dist_m = static_cast<double>(dist_cm_raw) / 100.0; // 转为米，ROS标准单位
+
+			  std::lock_guard<std::mutex> lock(data_mutex_);
+			  hw_states_range_ = dist_m;
+
+			  static rclcpp::Clock::SharedPtr log_clock = rclcpp::Clock::make_shared();
+			  RCLCPP_INFO_THROTTLE(
+				rclcpp::get_logger("R1Range"),
+				*log_clock, 500,
+				"【测距0x84】 raw cm: %u, range: %.3f m",
+				dist_cm_raw, hw_states_range_
+			  );
+			}
+#endif
+
+          }
+          state = 0; // 重新找下一帧
+        }
+        break;
+    }
+  }
 }
 
 }  // namespace r1_hardware_interface
 
-// 导出插件
 PLUGINLIB_EXPORT_CLASS(
   r1_hardware_interface::R1SystemHardware,
   hardware_interface::SystemInterface)

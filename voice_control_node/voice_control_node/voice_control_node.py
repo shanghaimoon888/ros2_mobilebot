@@ -34,17 +34,17 @@ class VoiceControlNode(Node):
 
         # 指令映射（线速度, 角速度）
         self.command_map = {
-            "前进": (0.02, 0.0),
-            "向前": (0.02, 0.0),
-            "后退": (-0.02, 0.0),
-            "向后": (-0.02, 0.0),
-            "左转": (0.0, 0.2),
-            "右转": (0.0, -0.2),
+            "前进": (0.2, 0.0),
+            "向前": (0.2, 0.0),
+            "后退": (-0.2, 0.0),
+            "向后": (-0.2, 0.0),
+            "左转": (0.0, 0.5),
+            "右转": (0.0, -0.5),
             "停": (0.0, 0.0),
             "停止": (0.0, 0.0),
         }
 
-        # reSpeaker Lite 设备索引
+        # reSpeaker Lite 设备索引 python3 -c "import sounddevice; print(sounddevice.query_devices())" 可查设备索引
         self.mic_device = 1
         self.sample_rate = 16000
         self.running = True

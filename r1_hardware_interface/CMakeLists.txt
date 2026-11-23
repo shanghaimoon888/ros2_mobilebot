@@ -25,6 +25,7 @@ target_include_directories(r1_hardware_interface PUBLIC
 )
 
 target_link_libraries(r1_hardware_interface
+  Threads::Threads
   ${PIGPIO_LIB}
   ${PIGPIOD_IF2_LIB}
 )
